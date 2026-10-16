@@ -1,0 +1,40 @@
+# cleandog_sim — M0 sizing and stair feasibility
+
+This project prioritizes **visualizations and human understanding** (see
+`../CLAUDE.md`). Every analysis here writes figures and a Markdown report to
+`../outputs/<date>_<topic>/`, which is git-ignored.
+
+```bash
+conda env create -f ../environment.yml   # once; then: conda activate cleandog
+pytest                                    # geometry, model and kinematics checks
+
+python scripts/visualize.py all           # every report below
+python scripts/visualize.py stairs        # stairwell geometry + 3D views
+python scripts/visualize.py ladder        # ladder-posture sweep, gallery, 2D-vs-3D poses
+python scripts/visualize.py bins          # bin rim height study
+
+# Interactive MuJoCo viewer (needs a display, i.e. your desktop terminal):
+python scripts/visualize.py view                  # stairwell, robot standing at the bottom
+python scripts/visualize.py view --ladder 13 3    # 13 cm segments in ladder posture, 3 cm belly gap
+python scripts/visualize.py view --flat
+
+python scripts/ladder_sweep.py            # the sweep as text tables (--csv out.csv)
+python scripts/build_models.py            # write MJCF scenes to sim/models/
+```
+
+| Module | What it does |
+| --- | --- |
+| `params.py` | `RobotParams` (the sweep knobs), `StairParams` (your stairwell), actuator specs |
+| `robot.py` | Parametric 12-DoF + 2-DoF neck MJCF; mass budget; stand pose |
+| `stairs.py` | Bullnose-tread stairwell: 2D profile for analysis, plus the MJCF switchback with partition, landing walls and balusters |
+| `scene.py` | Full scene assembly and `load_model()` |
+| `ladder.py` | Ladder-posture analysis: stance stroke, static torque, belly friction, whole-body poses |
+| `bin_reach.py` | Grid search over drop poses at a bin rim |
+| `viz.py`, `render.py` | Matplotlib figures and offscreen MuJoCo renders |
+
+MJCF is the single source of truth. Pinocchio and Crocoddyl load it directly
+(`pinocchio.buildModelFromMJCF`), so a URDF export can wait until ROS needs one.
+
+Actuator values marked `ESTIMATE` in `params.py` are placeholders until M1
+sysID. The torque-speed envelope (`JointActuation.torque_limit`) can't be
+expressed in MJCF, so the RL environment must apply it to commands.

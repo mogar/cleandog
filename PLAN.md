@@ -16,7 +16,7 @@ Each of your ten requirements maps to a testable spec. Values marked *M0* are fi
 
 | Requirement | Derived spec | How it's verified |
 | --- | --- | --- |
-| Stairs | Ascend and descend 19.7 cm rise × 21.6 cm run (23.5 cm tread including overhang) hardwood, 92.7 cm wide, 8 steps + landing + 7. Speed target ≤ 20 s per step (about 5 min per flight). Nothing is carried on stairs. | M3: 20 consecutive round trips with no intervention |
+| Stairs | Ascend and descend 19.7 cm rise × 21.6 cm run (23.5 cm tread including overhang) hardwood, 92.7 cm wide, 8 risers + landing (180° turn, 78" × 35") + 7 risers. Balusters on the open side of the lower flight; walls elsewhere. Speed target ≤ 20 s per step (about 5 min per flight). Nothing is carried on stairs. | M3: 20 consecutive round trips with no intervention |
 | Pick up objects | Mouth gripper on a 2–3 DoF neck. Payload 1.0 kg (hardback book) at about 25 cm reach. Lower jaw is a thin scoop, so flat objects can be slid under. Drops into floor-level bins. | M5: pick rate per object class |
 | Quiet | Quasi-direct-drive BLDC actuators with FOC; no hobby servos. Low gear ratio, soft feet, motor PWM above 20 kHz. Target: quieter than your Roomba at 1 m. | dBA meter at 1 m, M1 and M2 |
 | 45 min runtime | About 100 Wh pack (10S Li-ion) with margin (*M0*) | Timed flat-floor run in M2, full-task run in M6 |
@@ -40,7 +40,7 @@ In this frame, each step is an ordinary stride of about 30 cm. The swing foot on
 
 **What does the work:**
 
-- **Riser bracing.** Plant feet in the inside corner of each pocket. The riser then carries the downhill load: 67% of body weight at 42°. This means the robot doesn't depend on rubber-on-hardwood friction.
+- ~~**Riser bracing.** Plant feet in the inside corner of each pocket. The riser then carries the downhill load: 67% of body weight at 42°. This means the robot doesn't depend on rubber-on-hardwood friction.~~ **Corrected in M0 (2026-10-16):** no stair surface faces uphill, so the risers can't hold the robot from sliding downhill. Any uphill force comes from friction. Standing on the treads needs no friction, but resting on a slippery skid plate pushes the robot downhill: at 50% belly load with UHMW (μ 0.15), the feet need μ ≈ 0.67. Holding the full weight on the plate needs a plate μ of at least tan 42° = 0.91. M0 compares a grippy or ratcheting belly against never loading the belly.
 - **Skid plate on the nosings.** The belly can rest on the nosing line between strides, so the robot inches up like a sled. A belly plate of low-friction UHMW or acetal is fine, since you've ruled out carrying anything on stairs.
 - **Hip spacing near 29.2 cm.** If the front and rear hips sit one nosing-pitch apart, all four legs work at the same posture in their own pockets. M0 will sweep this value.
 - **Low center of mass.** On a 42° slope, the center of mass shifts downhill by its height above the nosing line × sin 42°. A short, flat body keeps it over the support polygon.
@@ -52,7 +52,7 @@ In this frame, each step is an ordinary stride of about 30 cm. The swing foot on
 - The landing is two of each.
 - On the way down, M0 will compare descending rear-first (a toddler going backward) with head-first. Rear-first keeps the center of mass on the uphill side.
 
-**Energy is a non-issue.** Lifting 9 kg up the full stairwell (about 3.1 m) takes about 275 J. That is under 0.1% of a 100 Wh pack. Stairs are limited by peak torque, actuator heating, and contact reliability, not battery.
+**Energy is a non-issue.** Lifting 9 kg up the full stairwell (15 risers, 2.96 m) takes about 260 J. That is under 0.1% of a 100 Wh pack. Stairs are limited by peak torque, actuator heating, and contact reliability, not battery.
 
 ## Mechanical architecture
 
@@ -293,9 +293,9 @@ The biggest risk is that the small-robot stair bet fails in M0. If that happens,
 
 **Open questions**
 
-- [ ] Tread depth answered: 9.25" is riser to nosing tip, so the run is 8.5" and the slope is 42°.
-- [ ] Does the landing turn (90°, 180°, or straight), and how deep is it?
-- [ ] Bin rim height? Under about 20 cm keeps the neck short.
+- [x] Tread depth answered: 9.25" is riser to nosing tip, so the run is 8.5" and the slope is 42°.
+- [x] Landing: 180° turn, 78" × 35". The flights sit side by side with a 5" partition. Stair counts are risers (8 + 7). *Still assumed:* the upper flight returns on the climber's left.
+- [x] Bin rim height: **proposed 20 cm (8")**, open top at least 45 × 30 cm. At a level stance with the neck straight forward, the jaw clears this rim with a book held flat. The static limit is about 46 cm. Bins are chosen for the project.
 - [ ] Is Pupper v3's CAD available as source (Onshape or STEP), not only STL?
 - [ ] Can your printer run CF-nylon? That needs an enclosure and a hardened nozzle. Otherwise use PETG for brackets and CNC for the load paths.
 

@@ -1,0 +1,16 @@
+[project]
+name = "cleandog-sim"
+version = "0.0.1"
+description = "M0 simulation sizing and stair-feasibility tools for the CleanDog quadruped"
+requires-python = ">=3.12"
+dependencies = ["mujoco>=3.3", "numpy", "scipy", "matplotlib", "pyyaml"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cleandog_sim"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,15 @@
+name: cleandog
+channels: [conda-forge]
+dependencies:
+  - python=3.12
+  - crocoddyl
+  - pinocchio
+  - numpy
+  - scipy
+  - matplotlib
+  - pyyaml
+  - pytest
+  - pip
+  - pip:
+      - mujoco
+      - -e ./sim

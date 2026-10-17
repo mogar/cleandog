@@ -18,7 +18,6 @@ def test_plan_geometry():
 def test_profile_solid_and_free_space():
     s = StairParams()
     shapes = flight_profile(s, FlightParams(n_risers=4, top_depth=1.0))
-    k = 2  # tread 2 top at z = 2*rise, its riser face at x = run
     probe = lambda x, z: bool(solid_mask(shapes, np.array(x), np.array(z)))
     assert not probe(s.run + 0.05, 2 * s.rise + 0.005)  # just above tread
     assert probe(s.run + 0.05, 2 * s.rise - 0.005)  # inside tread board

@@ -62,22 +62,23 @@ class RobotParams:
     """The ~10 parameters M0 sweeps, plus fixed mass-budget items."""
 
     # Body (x forward, y left, z up; origin at body centre)
-    body_length: float = 0.42
+    body_length: float = 0.378  # hip spacing + 12.8 cm (M0 transitions report, 2026-10-16)
     body_width: float = 0.22
     body_height: float = 0.08
-    hip_spacing: float = 0.292  # front-rear hip pitch-axis distance; plan's guess = nosing pitch
+    hip_spacing: float = 0.25  # front-rear hip pitch-axis distance (M0 transitions report)
     hip_width: float = 0.14  # left-right ab/ad axis distance
     hip_z: float = 0.0  # hip axis height relative to body centre
     abad_offset: float = 0.05  # lateral offset from ab/ad axis to leg plane
 
     # Legs
-    thigh_length: float = 0.13
-    shin_length: float = 0.13
+    thigh_length: float = 0.16  # M0: 13 cm proven infeasible on the transitions, 16 cm works
+    shin_length: float = 0.16
     foot_radius: float = 0.02
     thigh_radius: float = 0.018  # collision capsule radius
     shin_radius: float = 0.013
     # Sign of knee flexion about +y. -1: knee points backward (Go1/Spot style),
-    # +1: knee points forward. M0 sweeps the front/rear combinations.
+    # +1: knee points forward. M0 found knees must point downhill: backward knees for a
+    # robot that faces uphill on stairs (climbing forwards, descending rear-first).
     knee_sign_front: int = -1
     knee_sign_rear: int = -1
 

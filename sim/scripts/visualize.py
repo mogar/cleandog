@@ -4,6 +4,8 @@ Usage:
   python scripts/visualize.py stairs    # stairwell geometry + 3D views
   python scripts/visualize.py ladder    # ladder-posture sweep: gallery, heatmaps, 3D poses, friction
   python scripts/visualize.py bins      # bin rim height study
+  python scripts/visualize.py transitions   # stair transition plans (run transition_sweep.py first)
+  python scripts/visualize.py dynamics      # Crocoddyl results (run dynamics_run.py first)
   python scripts/visualize.py all
   python scripts/visualize.py view [--ladder SEG_CM GAP_CM]   # interactive viewer (needs a display)
 
@@ -26,7 +28,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import numpy as np
 
 from cleandog_sim import RobotParams, StairParams, build_scene_xml, load_model
-from cleandog_sim.ladder import ladder_pose, ladder_qpos, run_sweep, slope_frame
+from cleandog_sim.ladder import ladder_pose, ladder_qpos, run_sweep
 
 REPO = Path(__file__).resolve().parents[2]
 OUTPUTS = REPO / "outputs"
@@ -134,7 +136,6 @@ def cmd_ladder() -> Path:
     }
 
     # Whole-body poses at a few sizes, in 2D and as 3D renders of the actual MJCF.
-    fr = slope_frame(s)
     u_body = 3.5 * s.nosing_pitch
     pose_md, fk_errs = [], []
     for seg in (0.10, 0.13, 0.16, 0.20):
@@ -393,6 +394,333 @@ dynamics. Those belong to M5.
     return d
 
 
+# ---------------------------------------------------------------- transitions (M0 step 1)
+
+UP = ("lower-bottom-up", "lower-top-up", "upper-bottom-up", "upper-top-up")
+SCENARIO_LABELS = {
+    "lower-bottom-up": "floor→flight ↑", "lower-bottom-down": "flight→floor ↓",
+    "lower-top-up": "flight→landing ↑", "lower-top-down": "landing→flight ↓",
+    "upper-bottom-up": "landing→flight ↑", "upper-bottom-down": "flight→landing ↓",
+    "upper-top-up": "flight→floor ↑", "upper-top-down": "floor→flight ↓",
+}
+
+
+def latest(pattern: str) -> Path:
+    found = sorted(OUTPUTS.glob(pattern))
+    if not found:
+        raise SystemExit(f"no {pattern} under {OUTPUTS}; run the sweep first")
+    return found[-1]
+
+
+def load_transitions() -> tuple[Path, dict]:
+    import json
+
+    d = latest("*_transitions/results.json").parent
+    return d, json.loads((d / "results.json").read_text())
+
+
+def recommend(rows: list[dict]) -> tuple[tuple, list[tuple]]:
+    """Morphologies that pass all four uphill-facing scenarios (ascent, and rear-first descent
+    by time reversal), ranked: shortest legs, then most downhill-facing scenarios passed, then
+    lowest peak static hip torque."""
+    by = {}
+    for r in rows:
+        by.setdefault((r["seg"], r["knee"], r["hip_spacing"]), []).append(r)
+    ranked = []
+    for key, rs in by.items():
+        ok = {r["scenario"] for r in rs if r["status"] == "ok"}
+        if all(u in ok for u in UP):
+            n_down = sum(1 for r in rs if r["scenario"].endswith("down") and r["status"] == "ok")
+            peak = max(r["peak_hip"] for r in rs if r["status"] == "ok")
+            ranked.append((key, n_down, peak))
+    ranked.sort(key=lambda t: (t[0][0], -t[1], t[2]))
+    return (ranked[0][0] if ranked else None), ranked
+
+
+def cmd_transitions() -> Path:
+    from cleandog_sim import viz
+    from cleandog_sim.transitions import Planner, all_scenarios, morphology, turn_footprint
+
+    viz.style()
+    src, data = load_transitions()
+    rows = data["rows"]
+    d = out_dir("transitions")
+    s = StairParams()
+    names = [sc.name for sc in all_scenarios(s, 0.42)]
+    order = [n for n in names if n.endswith("up")] + [n for n in names if n.endswith("down")]
+    grid = save(viz.fig_success_grid(rows, order, SCENARIO_LABELS), d, "success_grid.png")
+    best, ranked = recommend(rows)
+
+    def planner_for(key, scenario):
+        p = morphology(*key)
+        sc = next(x for x in all_scenarios(s, p.body_length) if x.name == scenario)
+        return Planner(p, sc)
+
+    def as_path(raw):
+        return [(st[0], st[1], st[2], st[3], st[4], tuple(st[5])) for st in raw]
+
+    sections = []
+    if best:
+        p_best = morphology(*best)
+        for r in sorted((r for r in rows if (r["seg"], r["knee"], r["hip_spacing"]) == best),
+                        key=lambda r: order.index(r["scenario"])):
+            pl = planner_for(best, r["scenario"])
+            label = f"{SCENARIO_LABELS[r['scenario']]} ({pl.sc.label})"
+            if r["status"] != "ok":
+                sections.append(f"#### {label}: no plan ({r['status']})\n")
+                continue
+            path = as_path(r["path"])
+            strip = save(viz.fig_plan_filmstrip(pl, path, label), d, f"strip_{r['scenario']}.png")
+            gif = f"anim_{r['scenario']}.gif"
+            viz.animate_plan(pl, path, d / gif, label)
+            sections.append(f"#### {label}\n\n{r['steps']} steps, min stability margin "
+                            f"{r['min_margin'] * 100:.1f} cm, peak static torque hip {r['peak_hip']:.1f} Nm / "
+                            f"knee {r['peak_knee']:.1f} Nm.\n\n![]({gif})\n\n![]({strip})\n")
+
+    # Why the plan's 13 cm hypothesis fails: furthest progress on the floor -> flight transition.
+    fail_md = ""
+    key13 = (0.13, "back", 0.292)
+    r13 = next((r for r in rows if (r["seg"], r["knee"], r["hip_spacing"]) == key13
+                and r["scenario"] == "lower-bottom-up"), None)
+    if r13 and r13["status"] != "ok" and r13.get("best_path"):
+        pl = planner_for(key13, "lower-bottom-up")
+        bp = as_path(r13["best_path"])
+        f13 = save(viz.fig_plan_filmstrip(pl, bp, "13 cm segments, knee back: furthest the search got "
+                                          "(floor → flight)"), d, "fail_13cm.png")
+        diag = pl.diagnose(bp[-1])
+        table = "| Leg | end poses | trunk clear | 4 feet OK | can lift | path OK | has a foothold |\n" \
+                "| --- | --- | --- | --- | --- | --- | --- |\n" + "\n".join(
+                    f"| {leg} | {v['ends']} | {v['trunk_clear']} | {v['four_feet_ok']} | {v['can_lift']} | "
+                    f"{v['path_ok']} | {v['has_foothold']} |" for leg, v in diag.items())
+        fail_md = f"""## Why 13 cm segments fail
+
+PLAN.md's hypothesis was 12–13 cm segments. With backward knees the search
+stalls at the first riser. From its furthest state, here is how many of the
+candidate moves pass each check:
+
+{table}
+
+![]({f13})
+"""
+
+    fp_folded = turn_footprint(morphology(*best) if best else RobotParams(), neck_option=4)
+    fp_out = turn_footprint(morphology(*best) if best else RobotParams(), neck_option=0)
+    turn = save(viz.fig_landing_turn(s, morphology(*best) if best else RobotParams(), fp_folded,
+                                     "neck folded up"), d, "landing_turn.png")
+
+    knee_rows = []
+    for knee in ("back", "fwd", "out", "in"):
+        cells = []
+        for facing in ("up", "down"):
+            ok = sum(1 for r in rows if r["knee"] == knee and r["scenario"].endswith(facing) and r["status"] == "ok")
+            tot = sum(1 for r in rows if r["knee"] == knee and r["scenario"].endswith(facing))
+            cells.append(f"{ok}/{tot}")
+        knee_rows.append(f"| {knee} | {cells[0]} | {cells[1]} |")
+    knee_table = "\n".join(knee_rows)
+    rank_rows = "\n".join(f"| {k[0] * 100:.0f} cm | {k[1]} | {k[2] * 100:.1f} cm | {n}/4 | {pk:.1f} Nm |"
+                           for k, n, pk in ranked[:12])
+    md = f"""# Stair transitions: quasi-static crawl plans (M0 step 1)
+
+Generated {dt.datetime.now():%Y-%m-%d %H:%M} by `scripts/visualize.py transitions`, from
+`{src.name}/results.json` (sweep budget: {data['budget']} expansions or {data['time_limit']:.0f} s per plan).
+
+## Decision
+
+""" + (f"""**Recommended morphology: {best[0] * 100:.0f} cm thigh and shin, knees {best[1]},
+hip spacing {best[2] * 100:.1f} cm** (trunk {p_best.body_length * 100:.0f} cm long).
+It is the shortest-legged design that completes all four uphill-facing
+transitions, and the tie-breaks favour designs that also manage more
+downhill-facing ones, then lower hip torque. This replaces PLAN.md's 12–13 cm
+hypothesis: 13 cm is proven infeasible at the plan's 29.2 cm hip spacing,
+and 14 cm stays unresolved even with a 10× search budget, so it is
+marginal at best.""" if best else "**No morphology passed all four uphill-facing transitions.**") + f"""
+
+**Descend rear-first.** A quasi-static plan is still valid played backwards.
+So every uphill-facing plan, reversed, is a rear-first descent of the same
+transition. Head-first descent (the downhill-facing columns) is harder for the
+planner and unproven for most designs.
+
+**Knees should point downhill.** Backward knees succeed only facing uphill,
+and forward knees only facing downhill. Either way the knee sits on the
+downhill side of the leg, where it folds into the pocket instead of
+hitting the riser above. A robot that always faces uphill on the stairs
+(climbing forwards, descending rear-first) therefore wants backward knees.
+
+| Knees | Uphill-facing plans found | Downhill-facing plans found |
+| --- | --- | --- |
+{knee_table}
+
+**Turning on the landing works with the neck folded.** Turning in place needs
+a ⌀{2 * fp_folded['radius'] * 100:.0f} cm circle with the neck folded up, but
+⌀{2 * fp_out['radius'] * 100:.0f} cm with it straight out. The landing is
+{s.flights[0].top_depth * 100:.0f} cm deep.
+
+## How the planner works
+
+- **Geometry:** the side view of each transition, with the real tread,
+  bullnose, landing and wall dimensions. Left and right feet sit at
+  y = ±{(RobotParams().hip_width / 2 + RobotParams().abad_offset) * 100:.0f} cm.
+- **Moves:** a body shift with all four feet planted, then one foot steps.
+  Any leg may go next (a free gait); a fixed crawl order deadlocks at the
+  first riser. Before lifting a foot the body may sway sideways up to 5 cm.
+- **Every pose must pass:**
+  - each planted leg reaches its foothold within its knee and hip limits, with
+    reach to spare for the sway;
+  - thigh and shin (capsules) clear the stairs;
+  - the trunk and skid plate clear the stairs and walls;
+  - some neck fold clears them (the one with the best stability is used);
+  - the centre of mass, projected onto the floor, is ≥ 2 cm inside the support
+    polygon.
+- **Body pose:** each hip sits at one of 7 heights above the stepped terrain
+  envelope (the nosing line on a flight, the floor or landing elsewhere).
+  Front and rear are chosen independently, which sets the pitch.
+- **Search:** depth-first, ranked by progress with a one-step lookahead.
+- **Why no friction is needed:** with the centre of mass inside the support
+  polygon, vertical foot forces alone balance gravity.
+- **Statuses:** ✗ means the search space is exhausted (infeasible *within this
+  discretisation*); ? means the search ran out of budget, so the answer is
+  unknown.
+
+**Not modelled here:** the swing-foot path (Crocoddyl in step 2 adds it),
+dynamics, and the belly carrying load.
+
+## Results
+
+![]({grid})
+
+Morphologies passing all four uphill-facing transitions, best first:
+
+| Segments | Knees | Hip spacing | Downhill-facing passed | Peak static hip torque |
+| --- | --- | --- | --- | --- |
+{rank_rows}
+
+## Recommended morphology, every transition
+
+""" + "\n".join(sections) + f"""
+
+{fail_md}
+
+## Turning on the landing
+
+![]({turn})
+"""
+    (d / "report.md").write_text(md)
+    return d
+
+
+# ---------------------------------------------------------------- dynamics (M0 step 2)
+
+def cmd_dynamics() -> Path:
+    import json
+
+    import mujoco
+
+    from cleandog_sim import viz
+    from cleandog_sim.render import planner_to_world_qpos, render_trajectory_gif
+    from cleandog_sim.robot import joint_actuation
+    from cleandog_sim.transitions import morphology
+
+    viz.style()
+    src = latest("*_dynamics/summary.json").parent
+    summary = json.loads((src / "summary.json").read_text())
+    key = tuple(summary["morphology"])
+    p = morphology(*key)
+    s = StairParams()
+    acts = {ja.joint: ja for ja in joint_actuation(p)}
+    d = out_dir("dynamics")
+    model = mujoco.MjModel.from_xml_string(build_scene_xml(p, s.open_sides()))
+
+    demand = {r: dict(peak=0.0, rms=0.0, speed=0.0) for r in ("abad", "hip", "knee")}
+    sections, rows = [], []
+    results = sorted(summary["results"], key=lambda r: list(SCENARIO_LABELS).index(r["scenario"]))
+    for res in results:
+        z = np.load(src / f"{res['scenario']}.npz")
+        joints = res["joints"]
+        for role in demand:
+            idx = [joints.index(f"{leg}_{role}") for leg in ("FL", "FR", "RL", "RR")]
+            demand[role]["peak"] = max(demand[role]["peak"], float(np.abs(z["tau"][:, idx]).max()))
+            demand[role]["rms"] = max(demand[role]["rms"], float(np.sqrt((z["tau"][:, idx] ** 2).mean(0)).max()))
+            demand[role]["speed"] = max(demand[role]["speed"], float(np.abs(z["qd"][:, idx]).max()))
+        label = SCENARIO_LABELS[res["scenario"]]
+        flight, end, facing = res["scenario"].split("-")
+        f_tau = save(viz.fig_torque_traces(z["t"], z["tau"], joints, acts, f"{label}: joint torques"), d,
+                     f"torque_{res['scenario']}.png")
+        f_fric = save(viz.fig_friction_use(z["t"], z["friction"], 0.5, f"{label}: friction used (worst foot)"), d,
+                      f"friction_{res['scenario']}.png")
+        qpos = np.array([planner_to_world_qpos(q, s, flight, facing) for q in z["q"]])
+        gif = f"replay_{res['scenario']}.gif"
+        render_trajectory_gif(model, qpos, d / gif, dt=float(z["t"][1] - z["t"][0]), every=0.4,
+                              azimuth=65 if flight == "lower" else -60)
+        pen = max(res["penetration"].values(), default=0.0)
+        worst_part = max(res["penetration"], key=res["penetration"].get) if res["penetration"] else "-"
+        rows.append(f"| {label} | {'yes' if res['converged'] else 'no'} ({res['iterations']} it) | "
+                    f"{res['duration']:.0f} s | {max(res['peak_tau'][:12]):.1f} Nm | {max(res['rms_tau'][:12]):.1f} Nm | "
+                    f"{res['friction_max']:.2f} | {res['foot_err'] * 1000:.0f} mm | {pen * 1000:.0f} mm ({worst_part}) |")
+        sections.append(f"### {label}\n\n![]({gif})\n\n![]({f_tau})\n\n![]({f_fric})\n")
+
+    f_dem = save(viz.fig_actuator_demand(demand, acts), d, "actuator_demand.png")
+    spec_rows = "\n".join(
+        f"| {viz.ROLE_TITLES[r]} | {acts['FL_' + r].spec.name} | {demand[r]['peak']:.1f} → **{demand[r]['peak'] * 1.3:.1f}** | "
+        f"{acts['FL_' + r].peak_torque:.1f} | {demand[r]['rms']:.1f} → **{demand[r]['rms'] * 1.3:.1f}** | "
+        f"{acts['FL_' + r].rated_torque:.1f} | {demand[r]['speed']:.1f} → **{demand[r]['speed'] * 1.3:.1f}** | "
+        f"{acts['FL_' + r].max_speed:.0f} |" for r in demand)
+    md = f"""# Whole-body dynamics through the stair transitions (M0 step 2)
+
+Generated {dt.datetime.now():%Y-%m-%d %H:%M} by `scripts/visualize.py dynamics`, from
+`{src.name}`. Morphology: **{key[0] * 100:.0f} cm segments, knees {key[1]}, hip spacing
+{key[2] * 100:.1f} cm**, {p.total_mass_target} kg.
+
+## Method
+
+Crocoddyl solves a whole-body trajectory on the full 3D model, loaded from the
+same MJCF through Pinocchio. It follows each quasi-static plan from step 1.
+
+- **Timing:** each step is a 1.0 s body shift on four feet, then a 0.8 s
+  swing on three. That is slow, close to the ≤ 20 s-per-stair target.
+- **Contact:** planted feet are hard contact constraints. Their forces must
+  stay inside friction cones with μ = 0.5, a deliberately cautious value for
+  rubber on finished hardwood. An inscribed pyramid guarantees the true cone.
+- **Torque:** each joint is box-bounded at its actuator's peak torque.
+- **Swing feet:** each follows the planner's collision-free path through the
+  leg's free space.
+- **Replay:** every solution is replayed in MuJoCo in your stairwell to
+  measure any penetration. The replays hide walls and balusters for
+  visibility.
+
+## Summary
+
+| Transition | Converged | Duration | Peak torque | Worst RMS torque | Max friction used | Swing landing error | Worst penetration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+{chr(10).join(rows)}
+
+The penetration comes from the solver trading posture tracking for lower
+effort: the trunk drifts 1–2 cm from the plan in the tightest spots. The
+foot's rubber cover absorbs this scale, but treat it as a modelling tolerance,
+not a clearance.
+
+## Actuator spec (M0 exit criterion)
+
+Worst case over every transition, then × 1.3 for the required 30% margin.
+Heating is judged by RMS torque against the rated (continuous) torque.
+
+| Joint | Candidate | Peak needed → with margin | Actuator peak | RMS needed → with margin | Actuator rated | Speed needed → with margin (rad/s) | Actuator max speed |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+{spec_rows}
+
+![]({f_dem})
+
+**Caveats.** The actuator speed and friction values are estimates until M1's
+system identification (`params.py`, marked ESTIMATE). RMS is over the
+transition alone; a robot holding still on the stairs sits near its static
+torques, which the quasi-static plans bound.
+
+## Each transition
+
+""" + "\n".join(sections)
+    (d / "report.md").write_text(md)
+    return d
+
+
 # ---------------------------------------------------------------- interactive
 
 def cmd_view(args) -> None:
@@ -417,7 +745,7 @@ def cmd_view(args) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("stairs", "ladder", "bins", "all"):
+    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "all"):
         sub.add_parser(name)
     v = sub.add_parser("view")
     v.add_argument("--ladder", nargs=2, type=float, metavar=("SEG_CM", "GAP_CM"),
@@ -428,7 +756,8 @@ def main(argv=None) -> int:
     if args.cmd == "view":
         cmd_view(args)
         return 0
-    cmds = {"stairs": cmd_stairs, "ladder": cmd_ladder, "bins": cmd_bins}
+    cmds = {"stairs": cmd_stairs, "ladder": cmd_ladder, "bins": cmd_bins, "transitions": cmd_transitions,
+            "dynamics": cmd_dynamics}
     for name in (cmds if args.cmd == "all" else [args.cmd]):
         print(f"{name}: {cmds[name]()}/report.md")
     return 0

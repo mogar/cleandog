@@ -1,0 +1,727 @@
+"""Quasi-static crawl planner for stair transitions (sagittal geometry, top-view stability).
+
+The robot always moves toward +x in the planner frame. For walking down, the
+uphill terrain is mirrored (see terrain.Terrain.mirrored).
+
+A plan alternates two kinds of move:
+
+- **Shift:** all four feet stay planted while the body moves. The trunk
+  follows a smoothed terrain envelope at a chosen hip height `h`; its pitch
+  comes from where the front and rear hips sit on that envelope.
+- **Swing:** one leg moves to a new foothold while the other three hold the
+  robot up. This is a free gait: any leg may go next. A fixed crawl order
+  deadlocks at the first riser. Before a swing the body may
+  sway sideways by up to `max_sway`, as real quadrupeds do in a crawl. The
+  legs' sideways reach is not checked; 5 cm is small next to the 12 cm foot
+  offset.
+
+Every pose must satisfy all of these:
+
+- each planted leg reaches its foothold within the knee and hip limits, with
+  its thigh and shin clear of the stairs (links treated as capsules);
+- the trunk and skid plate clear the stairs and walls;
+- some neck/head fold clears them too;
+- the centre of mass, projected onto the floor, is inside the support polygon
+  of the planted feet by `margin`.
+
+Under those conditions vertical foot forces alone hold the robot, so no
+friction is needed. Time reversal also holds: a valid plan played backwards
+is valid. So "facing uphill" covers both ascent and rear-first descent, and
+"facing downhill" covers both head-first descent and backing up.
+
+Swings are checked too: with the body fixed, the foot must be able to travel
+from the old foothold to the new one through foot positions where the whole
+leg is valid (a 1 cm grid of the leg's free space), and that path becomes the
+swing reference for Crocoddyl.
+
+Not modelled here: dynamics, left/right differences in terrain, and the
+belly carrying load.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.optimize import lsq_linear
+
+from .ladder import leg_ik
+from .params import RobotParams, StairParams
+from .robot import LEGS, mass_breakdown
+from .terrain import Terrain, flight_terrain, foothold_candidates
+
+G = 9.81
+NECK_OPTIONS = ((0.0, 0.0), (-0.5, 0.5), (-1.0, 1.0), (-1.45, 1.45), (-1.45, 0.3), (0.4, 0.8), (0.0, 1.4))
+HIP_LIMIT = 2.6
+
+
+KNEES = {"back": (-1, -1), "fwd": (1, 1), "out": (1, -1), "in": (-1, 1)}  # (front, rear) knee signs
+# "out": front knees forward and rear knees back, so the knees point away from each other.
+
+
+def morphology(seg: float, knee: str, hip_spacing: float, base: RobotParams = RobotParams()) -> RobotParams:
+    """A sweep variant: equal thigh/shin `seg`, a knee layout, and hip spacing. The trunk length
+    tracks hip spacing, keeping the trunk's overhang beyond the hips constant."""
+    kf, kr = KNEES[knee]
+    return base.with_(thigh_length=seg, shin_length=seg, knee_sign_front=kf, knee_sign_rear=kr,
+                      hip_spacing=hip_spacing, body_length=hip_spacing + (base.body_length - base.hip_spacing))
+
+
+# ---------------------------------------------------------------- scenarios
+
+@dataclass
+class Scenario:
+    flight: str  # "lower" | "upper"
+    end: str  # "bottom" | "top"
+    facing: str  # "up" | "down"
+    terrain: Terrain  # planner frame (robot moves +x)
+    n_risers: int
+    s0: float  # initial trunk-centre x (planner frame)
+    start_sids: tuple[int, ...]
+    goal_sids: tuple[int, ...]
+
+    @property
+    def name(self) -> str:
+        return f"{self.flight}-{self.end}-{self.facing}"
+
+    @property
+    def label(self) -> str:
+        where = {("lower", "bottom"): "floor ↔ lower flight", ("lower", "top"): "lower flight ↔ landing",
+                 ("upper", "bottom"): "landing ↔ upper flight", ("upper", "top"): "upper flight ↔ upper floor"}
+        return f"{where[(self.flight, self.end)]}, facing {self.facing}hill"
+
+    def goal(self, sids) -> bool:
+        return all(s in self.goal_sids for s in sids)
+
+
+def make_scenario(s: StairParams, flight: str, end: str, facing: str, body_length: float) -> Scenario:
+    lower, upper = s.flights
+    if flight == "lower":
+        n, low_len, low_wall, top_len, top_wall = lower.n_risers, 1.5, False, lower.top_depth, True
+    else:
+        n, low_len, low_wall, top_len, top_wall = upper.n_risers, lower.top_depth, True, upper.top_depth, False
+    t = flight_terrain(s, n, low_len, low_wall, top_len, top_wall)
+    half = body_length / 2
+    x_tip_top = (n - 1) * s.run - s.overhang
+    treads = tuple(range(1, n))
+    if end == "bottom" and facing == "up":
+        s0 = max(-half - 0.15, -low_len + 0.03 + half) if low_wall else -half - 0.15
+        start, goal = (0,), tuple(k for k in treads if k >= 3)
+    elif end == "bottom" and facing == "down":
+        s0 = -(3.5 * s.run)
+        start, goal = treads, (0,)
+    elif end == "top" and facing == "up":
+        s0 = (n - 4.5) * s.run
+        start, goal = treads, (n,)
+    else:  # top, down
+        s0 = -x_tip_top - half - 0.15
+        if top_wall:
+            s0 = min(s0, -(x_tip_top + top_len) + 0.03 + half)
+        start, goal = (n,), tuple(k for k in treads if k <= n - 3)
+    if facing == "down":
+        t = t.mirrored()
+    return Scenario(flight, end, facing, t, n, s0, start, goal)
+
+
+def all_scenarios(s: StairParams, body_length: float) -> list[Scenario]:
+    return [make_scenario(s, fl, end, fa, body_length)
+            for fl in ("lower", "upper") for end in ("bottom", "top") for fa in ("up", "down")]
+
+
+# ---------------------------------------------------------------- robot geometry
+
+@dataclass
+class Poses:
+    """Vectorised trunk poses (N,)."""
+
+    centre: np.ndarray  # (N, 2)
+    pitch: np.ndarray  # (N,)
+
+    @property
+    def ex(self):
+        return np.stack([np.cos(self.pitch), np.sin(self.pitch)], -1)
+
+    @property
+    def ez(self):
+        return np.stack([-np.sin(self.pitch), np.cos(self.pitch)], -1)
+
+    def hip(self, p: RobotParams, front: bool) -> np.ndarray:
+        sign = 1 if front else -1
+        return self.centre + sign * self.ex * p.hip_spacing / 2 + self.ez * p.hip_z
+
+    def __getitem__(self, i):
+        return Poses(self.centre[i], self.pitch[i])
+
+
+class Planner:
+    def __init__(self, p: RobotParams, sc: Scenario, margin: float = 0.02,
+                 n_heights: int = 7, budget: int = 1500, max_sway: float = 0.05):
+        self.p, self.sc, self.t, self.margin, self.budget = p, sc, sc.terrain, margin, budget
+        # Hip heights above the stepped terrain envelope (nosing line on the flight, floor or
+        # landing elsewhere): from belly 1 cm above it up to 95% of leg reach. Front and rear
+        # are chosen independently.
+        self.hs = list(np.round(np.linspace(p.hip_above_belly + 0.01, 0.95 * p.leg_reach + p.foot_radius,
+                                            n_heights), 4))
+        self.cand, self.cand_sid = foothold_candidates(self.t, p.foot_radius)
+        xs = np.concatenate([[s.x0, s.x1] for s in self.t.surfaces])
+        self._env_x = np.arange(xs.min() - 0.5, xs.max() + 0.5, 0.004)
+        self._env_z = self.t.envelope(self._env_x)
+        self._raw_z = self.t.raw_envelope(self._env_x)
+        self.masses = mass_breakdown(p)
+        self.wy = p.hip_width / 2 + p.abad_offset
+        self.knee_back = {leg: (p.knee_sign_front if leg[0] == "F" else p.knee_sign_rear) == -1 for leg in LEGS}
+        self.expanded = 0
+        self.sways = np.linspace(-max_sway, max_sway, 11)
+        self._swing_cache: dict = {}
+        # Reach left for 3D effects the sagittal model ignores: the sway adds a sideways
+        # component, and the ab/ad tilt that absorbs it lifts the hip-pitch joint (which sits
+        # abad_offset outboard) by about 1 cm.
+        self.reach_2d = math.sqrt((p.leg_reach - 0.015) ** 2 - max_sway**2)
+
+    # -------------------------------------------------- poses
+
+    def env(self, x):
+        return np.interp(x, self._env_x, self._env_z)
+
+    def body(self, s, h) -> Poses:
+        s, h = np.atleast_1d(np.asarray(s, float)), np.broadcast_to(np.asarray(h, float), np.shape(np.atleast_1d(s)))
+        hs = self.p.hip_spacing
+        beta = np.zeros_like(s)
+        for _ in range(25):
+            c = np.cos(beta) * hs / 2
+            zr, zf = self.env(s - c) + h, self.env(s + c) + h
+            beta = np.arcsin(np.clip((zf - zr) / hs, -0.95, 0.95))
+        c = np.cos(beta) * hs / 2
+        mid = np.stack([s, (self.env(s - c) + self.env(s + c)) / 2 + h], -1)
+        ez = np.stack([-np.sin(beta), np.cos(beta)], -1)
+        return Poses(mid - ez * self.p.hip_z, beta)
+
+    def pose(self, x, z, beta) -> Poses:
+        x, z, beta = np.broadcast_arrays(*(np.atleast_1d(np.asarray(v, float)) for v in (x, z, beta)))
+        return Poses(np.stack([x, z], -1), beta)
+
+    def raw_env(self, x):
+        return np.interp(x, self._env_x, self._raw_z)
+
+    def target(self, x: float, h_front: float, h_rear: float) -> tuple[float, float, float]:
+        """Trunk pose with centre at x and each hip at its own height above the stepped envelope."""
+        hs, beta = self.p.hip_spacing, 0.0
+        for _ in range(12):
+            c = math.cos(beta) * hs / 2
+            zf, zr = float(self.raw_env(x + c)) + h_front, float(self.raw_env(x - c)) + h_rear
+            beta = math.asin(float(np.clip((zf - zr) / hs, -0.8, 0.8)))
+        z_mid = (zf + zr) / 2
+        return (round(x, 4), round(z_mid - math.cos(beta) * self.p.hip_z, 4), round(beta, 4))
+
+    # -------------------------------------------------- checks (vectorised over poses)
+
+    def leg_check(self, P: Poses, leg: str, feet: np.ndarray):
+        """feet (N, 2) or (2,). Returns (ok (N,), knee (N, 2))."""
+        hip = P.hip(self.p, leg[0] == "F")
+        feet = np.broadcast_to(feet, hip.shape)
+        ik = leg_ik(self.p, self.t, hip, feet, self.knee_back[leg])
+        # Leave reach for the sideways sway: the 3D hip-foot distance grows to sqrt(d^2 + sway^2).
+        in_reach = np.hypot(*(feet - hip).T) <= self.reach_2d
+        d = ik.knee - hip
+        c, s_ = np.cos(P.pitch), np.sin(P.pitch)
+        q_hip = np.arctan2(-(c * d[:, 0] + s_ * d[:, 1]), -(-s_ * d[:, 0] + c * d[:, 1]))
+        return ik.ok & in_reach & (np.abs(q_hip) <= HIP_LIMIT), ik.knee
+
+    def trunk_clear(self, P: Poses) -> np.ndarray:
+        p = self.p
+        hl, top, bot = p.body_length / 2, p.body_height / 2, -(p.body_height / 2 + p.skid_thickness)
+        pts = [(x, bot) for x in np.linspace(-hl, hl, 15)] + [(x, top) for x in np.linspace(-hl, hl, 7)]
+        pts += [(sx * hl, z) for sx in (-1, 1) for z in np.linspace(bot, top, 4)]
+        loc = np.array(pts)
+        world = P.centre[:, None, :] + loc[None, :, :1] * P.ex[:, None, :] + loc[None, :, 1:] * P.ez[:, None, :]
+        return ~self.t.solid(world[..., 0], world[..., 1], clearance=0.005).any(axis=1)
+
+    def neck_geometry(self, P: Poses, opt: int):
+        p = self.p
+        neck_rel, head_rel = NECK_OPTIONS[opt]
+        base = P.centre + P.ex * (p.body_length / 2 - 0.03) + P.ez * (p.body_height / 2)
+        a = P.pitch - neck_rel
+        tip = base + p.neck_length * np.stack([np.cos(a), np.sin(a)], -1)
+        b = a - head_rel
+        jaw = tip + p.head_length * np.stack([np.cos(b), np.sin(b)], -1)
+        return base, tip, jaw
+
+    def neck_feasible(self, P: Poses) -> np.ndarray:
+        """(N, n_options) mask of collision-free neck/head folds per pose."""
+        if not self.p.include_neck:
+            return np.ones((len(P.pitch), 1), bool)
+        t = np.linspace(0, 1, 10)
+        cols = []
+        for opt in range(len(NECK_OPTIONS)):
+            base, tip, jaw = self.neck_geometry(P, opt)
+            ok = np.ones(len(P.pitch), bool)
+            for a, b, r in ((base, tip, 0.022), (tip, jaw, 0.035)):
+                pts = a[:, None] + t[None, :, None] * (b - a)[:, None]
+                ok &= ~self.t.solid(pts[..., 0], pts[..., 1], clearance=r).any(axis=1)
+            cols.append(ok)
+        return np.stack(cols, 1)
+
+    def neck_option(self, P: Poses) -> np.ndarray:
+        """Index of the first collision-free neck/head fold per pose, or -1."""
+        feas = self.neck_feasible(P)
+        return np.where(feas.any(1), feas.argmax(1), -1)
+
+    def com_parts(self, P: Poses, knees: dict, feet: dict):
+        """Mass-weighted x sum and total mass of everything except the neck and head."""
+        m = self.masses
+        num = m["trunk"] * P.centre[:, 0]
+        tot = m["trunk"]
+        for leg in LEGS:
+            hip = P.hip(self.p, leg[0] == "F")
+            k, f = knees[leg], np.broadcast_to(feet[leg], hip.shape)
+            num = num + m["hip_link"] * hip[:, 0] + m["thigh"] * (hip[:, 0] + k[:, 0]) / 2 \
+                + m["shin_with_foot"] * (0.4 * k[:, 0] + 0.6 * f[:, 0])
+            tot += m["hip_link"] + m["thigh"] + m["shin_with_foot"]
+        return num, tot
+
+    def com_x(self, P: Poses, knees: dict, feet: dict, neck_opt) -> np.ndarray:
+        num, tot = self.com_parts(P, knees, feet)
+        if not self.p.include_neck:
+            return num / tot
+        m = self.masses
+        opt = np.broadcast_to(np.maximum(neck_opt, 0), P.pitch.shape)
+        geo = [self.neck_geometry(P, o) for o in range(len(NECK_OPTIONS))]
+        base, tip, jaw = (np.choose(opt[:, None], [g[i] for g in geo]) for i in range(3))
+        num = num + m["neck"] * (base[:, 0] + tip[:, 0]) / 2 + m["head"] * (tip[:, 0] + jaw[:, 0]) / 2
+        return num / (tot + m["neck"] + m["head"])
+
+    def support_margin(self, com_x: np.ndarray, stance_xy: list[np.ndarray], com_y=0.0) -> np.ndarray:
+        """Signed distance from (com_x, com_y) to the edges of the support polygon (positive inside)."""
+        pts = np.stack(stance_xy, 1)  # (N, k, 2)
+        c = pts.mean(1, keepdims=True)
+        order = np.argsort(np.arctan2(pts[..., 1] - c[..., 1], pts[..., 0] - c[..., 0]), axis=1)
+        pts = np.take_along_axis(pts, order[..., None], 1)
+        nxt = np.roll(pts, -1, axis=1)
+        e = nxt - pts
+        q = np.stack([com_x, np.broadcast_to(com_y, com_x.shape)], -1)[:, None, :] - pts
+        cross = e[..., 0] * q[..., 1] - e[..., 1] * q[..., 0]
+        return (cross / np.maximum(np.hypot(e[..., 0], e[..., 1]), 1e-9)).min(axis=1)
+
+    def foot_xy(self, leg: str, foot_x) -> np.ndarray:
+        y = self.wy if leg[1] == "L" else -self.wy
+        x = np.atleast_1d(foot_x)
+        return np.stack([x, np.full_like(x, y)], -1)
+
+    def evaluate(self, P: Poses, feet: dict, lifted: str | None = None):
+        """Check poses with planted feet; `lifted` leg is ignored for reach and support.
+
+        Returns (ok (N,), info dict)."""
+        ok = self.trunk_clear(P)
+        feas = self.neck_feasible(P)
+        ok &= feas.any(axis=1)
+        knees = {}
+        for leg in LEGS:
+            leg_ok, knees[leg] = self.leg_check(P, leg, feet[leg])
+            if leg != lifted:
+                ok &= leg_ok
+        all_xy = {leg: self.foot_xy(leg, np.broadcast_to(feet[leg], P.centre.shape)[:, 0]) for leg in LEGS}
+        four = [all_xy[leg] for leg in LEGS]
+        three = [all_xy[leg] for leg in LEGS if leg != lifted]
+        n = len(P.pitch)
+        marg, sway = np.full(n, -np.inf), np.zeros(n)
+        neck, cx = np.full(n, -1), np.zeros(n)
+        # The neck and head carry ~10% of the mass: fold them to whichever collision-free
+        # pose gives the best stability margin (head back when going downhill).
+        for opt in range(feas.shape[1]):
+            c = self.com_x(P, knees, feet, opt)
+            if lifted is None:
+                m_o, y_o = self.support_margin(c, four), np.zeros(n)
+            else:
+                # Sway the body sideways (all four feet down, so any sway between is also
+                # stable) to the y that best supports lifting this leg.
+                m_o, y_o = np.full(n, -np.inf), np.zeros(n)
+                for y in self.sways:
+                    m = np.minimum(self.support_margin(c, three, y), self.support_margin(c, four, y))
+                    m_o, y_o = np.maximum(m, m_o), np.where(m > m_o, y, y_o)
+            m_o = np.where(feas[:, opt], m_o, -np.inf)
+            better = m_o > marg
+            marg, sway = np.where(better, m_o, marg), np.where(better, y_o, sway)
+            neck, cx = np.where(better, opt, neck), np.where(better, c, cx)
+        return ok & (marg >= self.margin), dict(knees=knees, neck=neck, com_x=cx, margin=marg, sway=sway)
+
+    # -------------------------------------------------- search
+
+    def diagnose(self, state) -> dict[str, dict[str, int]]:
+        """Why can't each leg move from `state`? Counts of candidate end poses passing each check."""
+        x, z, beta, fi, ri, feet_idx = state
+        feet = self.feet_of(feet_idx)
+        nh = len(self.hs)
+        ends = [self.target(x + ds, self.hs[f], self.hs[r]) for ds in (0.10, 0.07, 0.04, 0.02, 0.0, -0.02, -0.04)
+                for f in range(nh) for r in range(nh)]
+        P_end = self.pose(*np.array(ends).T)
+        ok4, info4 = self.evaluate(P_end, feet)
+        trunk = self.trunk_clear(P_end)
+        neck = self.neck_option(P_end) >= 0
+        out = {}
+        for leg_i, leg in enumerate(LEGS):
+            ok_lift, _ = self.evaluate(P_end, feet, lifted=leg)
+            both = np.flatnonzero(ok4 & ok_lift)
+            n_path = sum(self.path_ok((x, z, beta), ends[i], feet) for i in both[:30])
+            n_swing = sum(bool(self.swing_candidates(ends[i], feet_idx, leg_i)) for i in both[:30])
+            out[leg] = dict(ends=len(ends), trunk_clear=int(trunk.sum()), neck_clear=int(neck.sum()),
+                            four_feet_ok=int(ok4.sum()), can_lift=int((ok4 & ok_lift).sum()),
+                            path_ok=int(n_path), has_foothold=int(n_swing))
+        return out
+
+    def feet_of(self, idx: tuple[int, ...]) -> dict:
+        return {leg: self.cand[i] for leg, i in zip(LEGS, idx)}
+
+    def same_side_ok(self, feet: dict) -> bool:
+        return all(feet[f"F{side}"][0] - feet[f"R{side}"][0] >= 0.06 for side in "LR")
+
+    def initial_state(self):
+        """State tuple: (x, z, pitch, front height index, rear height index, feet indices)."""
+        p = self.p
+        allowed = np.isin(self.cand_sid, self.sc.start_sids)
+        for ds in (0.0, -0.03, 0.03, -0.06, 0.06, -0.1, 0.1):
+            P = self.body(self.sc.s0 + ds, 0.7 * p.leg_reach)  # envelope pose, only to pick feet
+            idx = []
+            for leg in LEGS:
+                hip = P.hip(p, leg[0] == "F")[0]
+                ok, _ = self.leg_check(Poses(np.repeat(P.centre, len(self.cand), 0),
+                                             np.repeat(P.pitch, len(self.cand))), leg, self.cand)
+                ok &= allowed
+                if not ok.any():
+                    break
+                d = np.hypot(*(self.cand - hip).T)
+                score = np.abs(d - 0.75 * p.leg_reach) + 0.5 * np.abs(self.cand[:, 0] - hip[0])
+                idx.append(int(np.argmin(np.where(ok, score, np.inf))))
+            if len(idx) < 4:
+                continue
+            feet = self.feet_of(tuple(idx))
+            if not self.same_side_ok(feet):
+                continue
+            mid = 0.7 * p.leg_reach
+            for hi in sorted(range(len(self.hs)), key=lambda j: abs(self.hs[j] - mid)):
+                pose = self.target(self.sc.s0 + ds, self.hs[hi], self.hs[hi])
+                good, _ = self.evaluate(self.pose(*pose), feet)
+                if good[0]:
+                    return (*pose, hi, hi, tuple(idx))
+        return None
+
+    def path_ok(self, pose0, pose1, feet) -> bool:
+        """All four feet planted while the trunk moves linearly from pose0 to pose1."""
+        dist = max(abs(pose1[0] - pose0[0]), abs(pose1[1] - pose0[1]), 0.15 * abs(pose1[2] - pose0[2]))
+        n = int(max(2, math.ceil(dist / 0.01) + 1))
+        t = np.linspace(0, 1, n)[1:-1]
+        if not len(t):
+            return True
+        P = self.pose(*(a + t * (b - a) for a, b in zip(pose0, pose1)))
+        return bool(self.evaluate(P, feet)[0].all())
+
+    # -------------------------------------------------- swing space
+
+    SWING_RES = 0.01
+
+    def swing_space(self, pose, leg: str):
+        """Foot positions (1 cm grid) where the whole leg is valid with the body at `pose`:
+        reachable within joint limits, thigh and shin clear, and the foot sphere clear of the
+        terrain. Returns (gx, gz, free mask (nx, nz), component labels). Cached."""
+        key = (pose, leg)
+        if key in self._swing_cache:
+            return self._swing_cache[key]
+        from scipy import ndimage
+
+        P = self.pose(*pose)
+        hip = P.hip(self.p, leg[0] == "F")[0]
+        r = self.p.leg_reach
+        gx = np.arange(hip[0] - r, hip[0] + r + 1e-9, self.SWING_RES)
+        gz = np.arange(hip[1] - r, hip[1] + 0.12, self.SWING_RES)
+        X, Z = np.meshgrid(gx, gz, indexing="ij")
+        pts = np.stack([X.ravel(), Z.ravel()], 1)
+        n = len(pts)
+        ok, _ = self.leg_check(Poses(np.repeat(P.centre, n, 0), np.repeat(P.pitch, n)), leg, pts)
+        # The swinging foot keeps 5 mm clear of every surface; it leaves and reaches its
+        # footholds (which touch the surface) through the nearest free cell, ~1 cm away.
+        ok &= ~self.t.solid(pts[:, 0], pts[:, 1], clearance=self.p.foot_radius + 0.005)
+        free = ok.reshape(X.shape)
+        labels, _ = ndimage.label(free)
+        out = (gx, gz, free, labels)
+        if len(self._swing_cache) > 4000:
+            self._swing_cache.clear()
+        self._swing_cache[key] = out
+        return out
+
+    def _cell(self, gx, gz, pt):
+        i = int(np.clip(round((pt[0] - gx[0]) / self.SWING_RES), 0, len(gx) - 1))
+        j = int(np.clip(round((pt[1] - gz[0]) / self.SWING_RES), 0, len(gz) - 1))
+        return i, j
+
+    def _component(self, gx, gz, free, labels, pt) -> int:
+        """Label of the free component containing pt (or the nearest free cell within 2 cm)."""
+        i, j = self._cell(gx, gz, pt)
+        best, best_d = 0, 9
+        for di in range(-2, 3):
+            for dj in range(-2, 3):
+                a, b = i + di, j + dj
+                if 0 <= a < len(gx) and 0 <= b < len(gz) and free[a, b] and di * di + dj * dj < best_d:
+                    best, best_d = labels[a, b], di * di + dj * dj
+        return best
+
+    def swing_path(self, pose, leg: str, f0, f1) -> np.ndarray | None:
+        """Shortest 8-connected foot path through the leg's free space from f0 to f1 (2D points),
+        or None if they are not connected."""
+        import heapq
+
+        gx, gz, free, labels = self.swing_space(pose, leg)
+        c0, c1 = self._component(gx, gz, free, labels, f0), self._component(gx, gz, free, labels, f1)
+        if not c0 or c0 != c1:
+            return None
+        start = min(((self._cell(gx, gz, f0)[0] + di, self._cell(gx, gz, f0)[1] + dj)
+                     for di in range(-2, 3) for dj in range(-2, 3)),
+                    key=lambda c: (not (0 <= c[0] < len(gx) and 0 <= c[1] < len(gz) and labels[c] == c0),
+                                   abs(c[0] - self._cell(gx, gz, f0)[0]) + abs(c[1] - self._cell(gx, gz, f0)[1])))
+        goal_cells = {(a, b) for a in range(len(gx)) for b in range(len(gz))
+                      if labels[a, b] == c0 and abs(gx[a] - f1[0]) <= 0.021 and abs(gz[b] - f1[1]) <= 0.021}
+        dist, prev = {start: 0.0}, {}
+        heap = [(0.0, start)]
+        end = None
+        while heap:
+            d, c = heapq.heappop(heap)
+            if c in goal_cells:
+                end = c
+                break
+            if d > dist.get(c, np.inf):
+                continue
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    nb = (c[0] + di, c[1] + dj)
+                    if (di or dj) and 0 <= nb[0] < len(gx) and 0 <= nb[1] < len(gz) and free[nb]:
+                        nd = d + math.hypot(di, dj)
+                        if nd < dist.get(nb, np.inf):
+                            dist[nb], prev[nb] = nd, c
+                            heapq.heappush(heap, (nd, nb))
+        if end is None:
+            return None
+        cells = [end]
+        while cells[-1] != start:
+            cells.append(prev[cells[-1]])
+        path = np.array([[gx[a], gz[b]] for a, b in reversed(cells)])
+        return np.vstack([np.asarray(f0)[None], path, np.asarray(f1)[None]])
+
+    def swing_candidates(self, pose, feet_idx, leg_i) -> list[int]:
+        leg = LEGS[leg_i]
+        cur = self.cand[feet_idx[leg_i]]
+        P = self.pose(*pose)
+        idx = np.flatnonzero(self.cand[:, 0] > cur[0] + 0.02)
+        if not len(idx):
+            return []
+        PP = Poses(np.repeat(P.centre, len(idx), 0), np.repeat(P.pitch, len(idx)))
+        ok, _ = self.leg_check(PP, leg, self.cand[idx])
+        idx = idx[ok]
+        partner = ("R" if leg[0] == "F" else "F") + leg[1]
+        px = self.cand[feet_idx[LEGS.index(partner)]][0]
+        if leg[0] == "F":
+            idx = idx[self.cand[idx, 0] - px >= 0.06]
+        else:
+            idx = idx[px - self.cand[idx, 0] >= 0.06]
+        # The foot must be able to get there: same free component of the leg's swing space.
+        if len(idx):
+            gx, gz, free, labels = self.swing_space(pose, leg)
+            c0 = self._component(gx, gz, free, labels, cur)
+            idx = idx[[c0 != 0 and self._component(gx, gz, free, labels, self.cand[i]) == c0 for i in idx]]
+        hip = P.hip(self.p, leg[0] == "F")[0]
+        comfy = np.hypot(*(self.cand[idx] - hip).T) <= 0.9 * self.p.leg_reach
+        order = np.lexsort((-self.cand[idx, 0], ~comfy))  # comfortable first, then farthest
+        return [int(i) for i in idx[order][:3]]
+
+    def plan(self, time_limit: float = 60.0, goal=None):
+        """Depth-first search. Returns (list of states, status string).
+
+        `goal(state) -> bool` overrides the scenario's goal. On failure, `self.best_path`
+        holds the path that got furthest, for diagnosis.
+        """
+        start = self.initial_state()
+        self.best_path = None
+        if start is None:
+            return None, "no valid start pose"
+        goal = goal or (lambda st: self.sc.goal(self.cand_sid[list(st[5])]))
+        best_progress = -np.inf
+        visited = set()
+        t0 = time.time()
+        deltas = (0.10, 0.07, 0.04, 0.02, 0.0, -0.02, -0.04)
+        nh = len(self.hs)
+        stack = [(start, [start])]
+        while stack:
+            if self.expanded >= self.budget or time.time() - t0 > time_limit:
+                return None, "search budget exhausted"
+            state, path = stack.pop()
+            x, z, beta, fi, ri, feet_idx = state
+            if goal(state):
+                return path, "ok"
+            progress = x + self.cand[list(feet_idx), 0].mean()
+            if progress > best_progress:
+                best_progress, self.best_path = progress, path
+            key = (x, z, beta, feet_idx)
+            if key in visited:
+                continue
+            visited.add(key)
+            self.expanded += 1
+            feet = self.feet_of(feet_idx)
+
+            # Candidate end poses: shift size x (front, rear) hip heights, smallest height change first.
+            combos = sorted(((f, r) for f in range(nh) for r in range(nh)),
+                            key=lambda c: abs(c[0] - fi) + abs(c[1] - ri))
+            ends = [(ds, f, r, self.target(x + ds, self.hs[f], self.hs[r])) for ds in deltas for f, r in combos]
+            P_end = self.pose(*np.array([e[3] for e in ends]).T)
+            ok4, _ = self.evaluate(P_end, feet)
+
+            children = []
+            # Free gait: any leg may swing next. Rear-most legs first, so ties favour a crawl.
+            for leg_i in sorted(range(4), key=lambda i: self.cand[feet_idx[i]][0]):
+                ok_lift, _ = self.evaluate(P_end, feet, lifted=LEGS[leg_i])
+                found = 0
+                for e_i in np.flatnonzero(ok4 & ok_lift):  # in order: largest shift first
+                    ds, f, r, pose1 = ends[e_i]
+                    if not self.path_ok((x, z, beta), pose1, feet):
+                        continue
+                    cands = self.swing_candidates(pose1, feet_idx, leg_i)[:2]
+                    for c in cands:
+                        new_idx = list(feet_idx)
+                        new_idx[leg_i] = c
+                        children.append((*pose1, f, r, tuple(new_idx)))
+                    found += bool(cands)
+                    if found >= 2:
+                        break
+
+            # One-step lookahead: prefer moves after which some leg can lift without moving the
+            # body, then the most progress (body plus feet).
+            def rank(c):
+                P = self.pose(*c[:3])
+                cf = self.feet_of(c[5])
+                can_lift = any(self.evaluate(P, cf, lifted=l)[0][0] for l in LEGS)
+                return (not can_lift, -(c[0] + self.cand[list(c[5]), 0].mean()))
+
+            children = sorted(children, key=rank)[:8]
+            for c in reversed(children):  # best first off the stack
+                stack.append((c, path + [c]))
+        return None, "no plan within discretisation"
+
+
+# ---------------------------------------------------------------- plan post-processing
+
+@dataclass
+class Frame:
+    """One keyframe of a plan, with everything needed to draw it or seed Crocoddyl."""
+
+    kind: str  # "start" | "shift" | "swing"
+    s: float
+    h: float
+    feet: dict
+    swing_leg: str | None
+    swing_from: np.ndarray | None = None
+    centre: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    pitch: float = 0.0
+    knees: dict = field(default_factory=dict)
+    neck: int = 0
+    com_x: float = 0.0
+    margin: float = 0.0
+    torques: dict = field(default_factory=dict)  # leg -> (hip, knee) Nm, quasi-static
+
+
+def foot_forces(com_x: float, stance: dict[str, np.ndarray], wy: float, weight: float) -> dict[str, float]:
+    """Vertical forces at the stance feet balancing the weight (non-negative, least norm)."""
+    legs = list(stance)
+    A = np.array([[1.0] * len(legs), [stance[l][0] for l in legs], [wy if l[1] == "L" else -wy for l in legs]])
+    b = np.array([weight, weight * com_x, 0.0])
+    reg = 1e-3
+    A_aug = np.vstack([A, reg * np.eye(len(legs))])
+    b_aug = np.concatenate([b, np.zeros(len(legs))])
+    sol = lsq_linear(A_aug, b_aug, bounds=(0, np.inf))
+    return dict(zip(legs, sol.x))
+
+
+def expand_plan(pl: Planner, path: list) -> list[Frame]:
+    """Turn search states into keyframes: each step is a body shift (worst case: the next
+    leg about to lift) followed by a swing."""
+    frames = []
+    weight = pl.p.total_mass_target * G
+    prev = None
+    for st in path:
+        x, z, beta, fi, ri, feet_idx = st
+        feet = pl.feet_of(feet_idx)
+        if prev is None:
+            steps = [("start", feet, None, None)]
+        else:
+            moved = [l for l, a, b in zip(LEGS, prev[5], feet_idx) if a != b]
+            old = pl.feet_of(prev[5])
+            leg = moved[0] if moved else None
+            steps = [("shift", old, leg, None)]
+            if leg:
+                steps.append(("swing", feet, None, old[leg]))
+        for kind, use_feet, lifted, swing_from in steps:
+            P = pl.pose(x, z, beta)
+            ok, info = pl.evaluate(P, use_feet, lifted=lifted)
+            stance = {l: use_feet[l] for l in LEGS if l != lifted}
+            forces = foot_forces(float(info["com_x"][0]), stance, pl.wy, weight)
+            torques = {}
+            for l, f in forces.items():
+                hip = P.hip(pl.p, l[0] == "F")[0]
+                knee = info["knees"][l][0]
+                torques[l] = (abs((use_feet[l][0] - hip[0]) * f), abs((use_feet[l][0] - knee[0]) * f))
+            swing_leg = lifted if kind == "shift" else (steps[0][2] if kind == "swing" else None)
+            frames.append(Frame(kind, x, pl.hs[fi], dict(use_feet), swing_leg, swing_from, P.centre[0], beta,
+                                {l: v[0] for l, v in info["knees"].items()}, int(info["neck"][0]),
+                                float(info["com_x"][0]), float(info["margin"][0]), torques))
+            frames[-1].sway = float(info["sway"][0])
+        prev = st
+    return frames
+
+
+@dataclass
+class PlanResult:
+    scenario: str
+    status: str
+    steps: int
+    expanded: int
+    seconds: float
+    min_margin: float
+    peak_hip: float
+    peak_knee: float
+    frames: list[Frame] | None = None
+
+
+def plan_scenario(p: RobotParams, sc: Scenario, keep_frames: bool = False, **kw) -> PlanResult:
+    t0 = time.time()
+    pl = Planner(p, sc, **kw)
+    path, status = pl.plan()
+    if path is None:
+        return PlanResult(sc.name, status, 0, pl.expanded, time.time() - t0, math.nan, math.nan, math.nan)
+    frames = expand_plan(pl, path)
+    torques = [t for f in frames for t in f.torques.values()]
+    return PlanResult(sc.name, status, len(path) - 1, pl.expanded, time.time() - t0,
+                      min(f.margin for f in frames), max(t[0] for t in torques), max(t[1] for t in torques),
+                      frames if keep_frames else None)
+
+
+# ---------------------------------------------------------------- landing turn (top view)
+
+def turn_footprint(p: RobotParams, neck_option: int = 3) -> dict:
+    """Top-view extents of the robot standing level with the neck folded (NECK_OPTIONS index).
+
+    Returns the corner points of the body, neck and head, and feet (x forward, y left, relative
+    to the trunk centre) and the radius swept by turning in place about the trunk centre.
+    """
+    hl, hw = p.body_length / 2, p.body_width / 2
+    pts = [(sx * hl, sy * hw) for sx in (-1, 1) for sy in (-1, 1)]
+    wy = p.hip_width / 2 + p.abad_offset
+    feet = [(sx * p.hip_spacing / 2, sy * (wy + p.foot_radius)) for sx in (-1, 1) for sy in (-1, 1)]
+    neck_x = []
+    if p.include_neck:
+        neck_rel, head_rel = NECK_OPTIONS[neck_option]
+        base = hl - 0.03
+        tip = base + p.neck_length * math.cos(-neck_rel)
+        jaw = tip + p.head_length * math.cos(-neck_rel - head_rel)
+        neck_x = [tip, jaw]
+        pts += [(x, sy * 0.04) for x in (tip, jaw) for sy in (-1, 1)]
+    pts += feet
+    radius = max(math.hypot(x, y) for x, y in pts)
+    return dict(points=np.array(pts), feet=np.array(feet), radius=radius,
+                front=max(x for x, _ in pts), rear=min(x for x, _ in pts), neck_x=neck_x)

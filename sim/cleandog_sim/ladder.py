@@ -19,12 +19,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from functools import lru_cache
 
 import numpy as np
 
-from .params import FlightParams, RobotParams, StairParams
-from .stairs import flight_profile, inflate, solid_mask
+from .params import RobotParams, StairParams
+from .terrain import Terrain, interior_terrain
 
 G = 9.81
 
@@ -63,12 +62,6 @@ def pocket_targets(s: StairParams, k: int, foot_radius: float, n: int = 9) -> np
     return np.stack([np.linspace(x_corner, x_nose, n), np.full(n, z)], axis=1)
 
 
-@lru_cache(maxsize=64)
-def _interior_shapes(s: StairParams, clearance: float = 0.0):
-    """A long single flight, so every pocket analysed is an interior one, grown by `clearance`."""
-    return inflate(flight_profile(s, FlightParams(n_risers=40, top_depth=1.0)), clearance)
-
-
 @dataclass
 class LegIK:
     """Vectorised planar IK result; arrays share the broadcast shape of hips and feet."""
@@ -78,12 +71,15 @@ class LegIK:
     flex: np.ndarray  # knee flexion magnitude, rad (0 = straight)
 
 
-def leg_ik(p: RobotParams, s: StairParams, hips: np.ndarray, feet: np.ndarray, knee_back: bool,
+def leg_ik(p: RobotParams, terrain: StairParams | Terrain, hips: np.ndarray, feet: np.ndarray, knee_back: bool,
            flex_limits: tuple[float, float] = (0.2, 2.7), n_samples: int = 24) -> LegIK:
     """Planar two-link IK in the world x-z plane, for a body facing uphill along the slope.
 
-    knee_back puts the knee on the downhill side of the hip-foot line.
+    knee_back puts the knee on the -x side of the hip-foot line (behind it, for a robot
+    facing +x). `terrain` may be StairParams, meaning the interior of an endless flight.
     """
+    if isinstance(terrain, StairParams):
+        terrain = interior_terrain(terrain)
     l1, l2 = p.thigh_length, p.shin_length
     hips, feet = np.broadcast_arrays(np.asarray(hips, float), np.asarray(feet, float))
     d_vec = feet - hips
@@ -103,12 +99,11 @@ def leg_ik(p: RobotParams, s: StairParams, hips: np.ndarray, feet: np.ndarray, k
     # Each link is a capsule: test its centreline against the stairs grown by its radius.
     for a_pt, b_pt, skip, radius in ((hips, knee, 0.0, p.thigh_radius),
                                      (knee, feet, p.foot_radius * 1.5, p.shin_radius)):
-        shapes = _interior_shapes(s, radius)
         seg = b_pt - a_pt
         length = np.maximum(np.hypot(seg[..., 0], seg[..., 1]), 1e-9)
         tt = t * np.maximum(1.0 - skip / length, 0.0)[..., None]  # stop short of the foot
         pts = a_pt[..., None, :] + tt[..., None] * seg[..., None, :]
-        ok &= ~solid_mask(shapes, pts[..., 0], pts[..., 1]).any(axis=-1)
+        ok &= ~terrain.solid(pts[..., 0], pts[..., 1], clearance=radius).any(axis=-1)
     return LegIK(ok=ok, knee=knee, flex=flex)
 
 

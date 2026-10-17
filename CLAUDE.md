@@ -15,9 +15,13 @@ and check: figures, renders, and the maths written out.
   report how far apart they are, so each checks the other.
 - Write out the derivation behind each major decision in the report: equations,
   assumptions, and what is *not* modelled.
-- Look at every generated figure before reporting results. Several M0 bugs (a
-  missing link thickness, wrong camera angles, a misleading example pose) were
-  found only by looking.
+- Look at every generated figure before reporting results. Many M0 bugs were
+  found only by looking. Among them: a missing link thickness, wrong camera
+  angles, a planner deadlock at the first riser, an IK branch flip, and swing
+  legs cutting through nosings.
+- Cross-check models against each other. The 2D planner, the MuJoCo replay and
+  the Pinocchio/Crocoddyl model must agree; reports state the disagreement
+  (for example, the penetration in the replays).
 
 ## Experimental outputs: `outputs/` (git-ignored)
 
@@ -29,8 +33,14 @@ record the conclusion in `PLAN.md`, because outputs are not versioned.
 
 ```bash
 conda activate cleandog
-cd sim && python scripts/visualize.py all   # stairs, ladder sweep, bin rim reports
+cd sim && python scripts/visualize.py stairs|ladder|bins   # fast, self-contained reports
+python scripts/transition_sweep.py && python scripts/visualize.py transitions   # M0 step 1 (~35 min)
+python scripts/dynamics_run.py && python scripts/visualize.py dynamics          # M0 step 2 (~1 min)
 ```
+
+Compute-heavy steps write their data (JSON/NPZ) into `outputs/`, and the
+`visualize.py` command rebuilds the report from it, so figures can be
+iterated without recomputing.
 
 ## Conventions
 

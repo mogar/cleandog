@@ -131,7 +131,7 @@ def add_robot(worldbody: ET.Element, actuator: ET.Element, sensor: ET.Element,
     masses = mass_breakdown(p)
     trunk = ET.SubElement(worldbody, "body", name="trunk", pos=_fmt(*pos),
                           euler=_fmt(*(math.radians(e) for e in euler)))
-    ET.SubElement(trunk, "freejoint", name="root")
+    ET.SubElement(trunk, "freejoint", name="root_joint")  # name Crocoddyl expects
     ET.SubElement(
         trunk, "inertial", pos="0 0 0", mass=_fmt(masses["trunk"]),
         diaginertia=_fmt(*_box_inertia(masses["trunk"], p.body_length, p.body_width, p.body_height)),

@@ -16,7 +16,6 @@ A pose counts as a drop when all of these hold:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np

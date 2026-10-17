@@ -30,7 +30,7 @@ Each of your ten requirements maps to a testable spec. Values marked *M0* are fi
 
 ## Stairwell geometry: why a small robot can climb it
 
-In the body frame, your stairs look like flat ground with 14.5 cm-deep pockets. A robot with legs of roughly 13 cm per segment should be able to walk it. That figure is a hypothesis for M0 to test, not a design value.
+In the body frame, your stairs look like flat ground with 14.5 cm-deep pockets. A robot with legs of roughly 13 cm per segment should be able to walk it. That figure is a hypothesis for M0 to test, not a design value. **M0 result (2026-10-16): 13 cm fails at the transitions; 16 cm is needed** (see the M0 status below).
 
 **Your stairs:** rise 7.75" (19.7 cm), tread 9.25" (23.5 cm) from riser to nosing tip, so the run is 8.5" (21.6 cm); width 36.5" (92.7 cm). The nosing is rounded, 1" (2.5 cm) thick, with 0.75" (1.9 cm) overhang. That is a 42° slope, steeper than current code allows (about 37.8° at 7¾ / 10). The distance from one nosing to the next is 29.2 cm.
 
@@ -50,7 +50,7 @@ In this frame, each step is an ordinary stride of about 30 cm. The swing foot on
 - At the top of each flight the slope turns convex. The skid plate can high-center on the last nosing while the front legs reach flat floor.
 - At the bottom it turns concave. The front legs must reach up before the body can pitch.
 - The landing is two of each.
-- On the way down, M0 will compare descending rear-first (a toddler going backward) with head-first. Rear-first keeps the center of mass on the uphill side.
+- On the way down, M0 will compare descending rear-first (a toddler going backward) with head-first. Rear-first keeps the center of mass on the uphill side. **M0 result: descend rear-first.** It is the ascent played backwards, so it is feasible wherever ascent is. Head-first descent was not found for the recommended design.
 
 **Energy is a non-issue.** Lifting 9 kg up the full stairwell (15 risers, 2.96 m) takes about 260 J. That is under 0.1% of a 100 Wh pack. Stairs are limited by peak torque, actuator heating, and contact reliability, not battery.
 
@@ -80,7 +80,7 @@ Several listings showed backorders. Buy the M1 actuators as the exact model you'
 ### Legs, feet and belly
 
 - **Three DoF per leg.** Hip ab/ad and hip pitch sit at the body. The knee motor is also mounted at the hip and drives the knee through a belt or linkage. This keeps leg inertia low and avoids putting a gearbox at the foot, where it would be loud.
-- **Segments:** about 12–15 cm each (*M0*). Thigh and shin as CNC aluminum or carbon tube, joints as printed or machined housings.
+- **Segments:** 16 cm each, with knees pointing backward (M0 result; was 12–15 cm). Thigh and shin as CNC aluminum or carbon tube, joints as printed or machined housings.
 - **Feet:** rubber hemispheres over a foam core, for grip on hardwood and quiet touchdown. They are shaped to seat into the riser corner.
 - **Skid plate:** full-length UHMW or acetal belly plate with rounded front and rear lips, so it slides onto and off the nosings without catching.
 
@@ -207,6 +207,19 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
   - An actuator torque/speed spec with ≥ 30% margin.
   - ≥ 95% simulated round trips on your stairwell.
   - A go/no-go on the Pupper v3 testbed (below).
+- **Status (2026-10-16): exit items 1, 2 and 4 met; item 3 (RL round trips) is next.** Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
+  - **Morphology:** 16 cm thigh and shin, knees backward, hip spacing 25 cm, trunk about 38 × 22 cm, 8.5 kg budget.
+    - A quasi-static free-gait planner with verified swing paths completes all four uphill-facing transitions: floor→flight, flight→landing, landing→flight, flight→upper floor.
+    - 13 cm segments are proven infeasible at 29.2 cm hip spacing; 14 cm was not resolved even with a 10× search budget.
+  - **Knees must point downhill:** backward knees work facing uphill, forward knees facing downhill. So the robot climbs forwards and descends rear-first.
+  - **Landing turn:** turning in place needs a 46 cm circle with the neck folded, which fits the 89 cm landing. With the neck straight out it needs 86 cm.
+  - **Actuators:** Crocoddyl whole-body trajectories (μ = 0.5 friction cones, about 1 min per transition) confirm the RobStride 02 / DM-J4310P choice with the ≥ 30% margin:
+    - knee needs 10.7 Nm peak (13.9 with margin) against 17 Nm, and 2.9 Nm RMS (3.8) against 6 Nm rated;
+    - hip pitch needs 6.9 Nm peak and 1.4 Nm RMS;
+    - ab/ad needs 2.8 Nm peak;
+    - joint speeds stay under 5 rad/s.
+  - **Pupper v3 testbed: no-go.** The chosen size (16 cm segments) is well above Pupper scale.
+  - **Bin rim:** 20 cm confirmed for the 16 cm robot.
 
 **M1 — One leg on a test stand** · $600–1,000
 

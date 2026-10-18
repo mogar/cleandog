@@ -1049,6 +1049,313 @@ above.
     return d
 
 
+DIR_NAMES = ("forward", "forward-left", "left", "back-left", "back", "back-right", "right", "forward-right")
+
+
+def cmd_rl_failures(tag: str = "main") -> Path:
+    """M0 step 3d report: shove map along the round trip and forensic replays of the worst moments."""
+    import json
+
+    import mujoco
+    from PIL import Image
+
+    from cleandog_sim import viz
+    from cleandog_sim.reference import Reference
+    from cleandog_sim.render import View, render_views
+    from cleandog_sim.robot import LEGS
+    from cleandog_sim.transitions import morphology
+
+    viz.style()
+    src = latest("*_rl/reference.json").parent
+    diag = json.loads((src / f"diagnose_{tag}.json").read_text())
+    sm = np.load(src / f"diagnose_{tag}.npz")
+    ev = json.loads((src / f"eval_{tag}.json").read_text())
+    evz = np.load(src / f"eval_{tag}.npz")
+    ref_info = json.loads((src / "reference.json").read_text())
+    ref = Reference.load(src / "reference.npz")
+    segs = ref_info["segments"]
+    p, s = morphology(*ref_info["morphology"]), StairParams()
+    d = out_dir("rl-failures")
+    dt_c, nd, lead = diag["dt"], diag["n_dirs"], diag["lead"]
+    speeds = diag["speeds"]
+    vmax = max(speeds)
+
+    frac = {}
+    for v in speeds:
+        sel = sm["speed"] == v
+        frac[v] = sm["failed"][sel].reshape(-1, nd).mean(1)
+        times = sm["frame"][sel].reshape(-1, nd)[:, 0] * dt_c
+    eval_fail = evz["rand_failed_at"][evz["rand_failed_at"] >= 0] * dt_c
+    f_map = save(viz.fig_shove_map(times, frac, segs, eval_fail), d, "shove_map.png")
+
+    # Breakdown at the largest speed: gait phase at the shove, and direction relative to the trunk.
+    sel = sm["speed"] == vmax
+    fr, failed, ang = sm["frame"][sel], sm["failed"][sel], sm["angle"][sel]
+    phase_rates: dict[str, list[int]] = {}
+    dir_rates = {n: [0, 0] for n in DIR_NAMES}
+    for f, fl, a in zip(fr, failed, ang):
+        c = ref.contact[f]
+        seg = ref.segment_names[ref.segment[f]]
+        where = "landing" if "landing" in seg else ("flight" if "flight" in seg else "standing")
+        what = "all four feet down" if c.all() else f"{LEGS[int(np.argmin(c))]} swinging"
+        for key in (f"{where}: {what}",):
+            phase_rates.setdefault(key, [0, 0])
+            phase_rates[key][0] += int(fl)
+            phase_rates[key][1] += 1
+        w, x, y, z = ref.qpos[f, 3:7]
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        k = int(round(((a - yaw) % (2 * math.pi)) / (2 * math.pi / nd))) % nd
+        dir_rates[DIR_NAMES[k]][0] += int(fl)
+        dir_rates[DIR_NAMES[k]][1] += 1
+    phase_rates = dict(sorted(phase_rates.items()))
+    f_break = save(viz.fig_shove_breakdown({k: tuple(v) for k, v in phase_rates.items()},
+                                           {k: tuple(v) for k, v in dir_rates.items()}, vmax), d, "shove_breakdown.png")
+
+    # Failure rate against the reference trunk pitch at the shove (flights only).
+    frames = fr.reshape(-1, nd)[:, 0]
+    frac_v = failed.reshape(-1, nd).mean(1)
+    w, x, y, zq = ref.qpos[frames, 3:7].T
+    pitch = np.abs(np.degrees(np.arcsin(np.clip(2 * (w * y - zq * x), -1, 1))))
+    on_flight = np.array(["flight" in ref.segment_names[ref.segment[f]] for f in frames])
+    edges = [0, 10, 20, 30, 40, 50, 60]
+    p_rates, p_counts = [], []
+    for lo_, hi_ in zip(edges[:-1], edges[1:]):
+        m = on_flight & (pitch >= lo_) & (pitch < hi_)
+        p_rates.append(frac_v[m].mean() if m.any() else 0.0)
+        p_counts.append(int(m.sum()))
+    p_rates, p_counts = np.array(p_rates), np.array(p_counts)
+    f_pitch = save(viz.fig_shove_vs_pitch(edges, p_rates, p_counts, math.degrees(s.slope), vmax), d,
+                   "shove_vs_pitch.png")
+    steep = on_flight & (pitch >= 40)
+    shallow = on_flight & (pitch < 40)
+    per_shove = float(np.mean([np.mean(sm["failed"][sm["speed"] == v]) for v in speeds]))
+    T = len(ref.qpos) * dt_c
+    n_shoves = T / 7.0  # one every U(4, 10) s on average
+    surv = (1 - per_shove) ** n_shoves
+    need = 1 - 0.95 ** (1 / n_shoves)
+
+    # Forensics.
+    model = mujoco.MjModel.from_xml_string(build_scene_xml(p, s.open_sides()))
+    joints = ev["joints"]
+    sections = []
+    for k, fo in enumerate(diag["forensics"]):
+        z = np.load(src / f"diagnose_{tag}_forensic{k}.npz")
+        f = fo["frame"]
+        seg = ref.segment_names[ref.segment[f]]
+        c = ref.contact[f]
+        what = "all four feet down" if c.all() else f"{LEGS[int(np.argmin(c))]} swinging"
+        w, x, y, zq = ref.qpos[f, 3:7]
+        yaw = math.atan2(2 * (w * zq + x * y), 1 - 2 * (y * y + zq * zq))
+        rel = DIR_NAMES[int(round(((fo["angle"] - yaw) % (2 * math.pi)) / (2 * math.pi / nd))) % nd]
+        title = (f"t = {fo['time']:.1f} s ({seg}, {what}): {fo['speed']:.2f} m/s shove {rel}. "
+                 f"MJX: {fo['fail_frac']:.0%} of directions fail; CPU: "
+                 + (f"fails {(fo['cpu_failed_at'] - lead) * dt_c:.1f} s after" if fo["cpu_failed_at"] >= 0
+                    else "recovers"))
+        f_for = save(viz.fig_forensic(dt_c, lead, z["pos_err"], z["forces"], fo["contact_names"], z["saturated"],
+                                      joints, title, ev["term_pos"]), d, f"forensic{k}.png")
+        # Filmstrip: fixed camera at the trunk's position at the shove.
+        q = z["qpos"]
+        end = fo["cpu_failed_at"] if fo["cpu_failed_at"] >= 0 else len(q) - 1
+        picks = [lead - 20] + list(np.linspace(lead + 5, min(end + 10, len(q) - 1), 4).astype(int))
+        look = tuple(q[lead, :3])
+        tiles = []
+        for i in picks:
+            names = render_views(model, q[i], [View(f"f{k}_{i}", look, 1.3, 65, -15)], d, "tmp", size=(300, 400))
+            tiles.append(Image.open(d / names[0]))
+            (d / names[0]).unlink()
+        strip = Image.new("RGB", (400 * len(tiles), 300))
+        for j, im in enumerate(tiles):
+            strip.paste(im, (400 * j, 0))
+        strip.save(d / f"forensic{k}_film.png")
+        labels = " · ".join(f"{(i - lead) * dt_c:+.1f} s" for i in picks)
+        top = [n for n in fo["contact_names"] if not n.split("|")[0].endswith("_foot")]
+        sections.append(f"### {k + 1}. t = {fo['time']:.1f} s\n\n![]({f_for})\n\n![](forensic{k}_film.png)\n\n"
+                        f"Frames: {labels}. Non-foot contacts during the replay: "
+                        f"{', '.join(viz._contact_label(n) for n in top) or 'none'}.\n")
+
+    n_trials = len(sm["failed"])
+    rate_by_speed = ", ".join(f"{np.mean(sm['failed'][sm['speed'] == v]):.1%} at {v:.2f} m/s" for v in speeds)
+    md = f"""# Why shoved round trips fail (M0 step 3d)
+
+Generated {dt.datetime.now():%Y-%m-%d %H:%M} by `scripts/visualize.py rl_failures`, from
+`{src.name}/diagnose_{tag}.*`. Policy `{tag}` ({diag['policy_step'] / 1e6:.0f}M steps).
+
+## Question
+
+The tracking policy completes 94.7% of randomized round trips without shoves
+but only 74.5% with them. Its failures recur at the same places, going up and
+coming down. Which moments are fragile, and what goes wrong there?
+
+## Method
+
+**Shove map.** The nominal robot starts from the reference 2 s before a
+moment, gets one shove, and runs 5 s more. A trial fails by the same rule as
+the round-trip evaluation: the trunk strays more than {ev['term_pos'] * 100:.0f} cm or
+{ev['term_rot']:.1f} rad from the reference.
+- **Grid:** shove moments every {diag['every']} s over the whole trip, at
+  {', '.join(f'{v:.2f}' for v in speeds)} m/s, in {nd} directions, for
+  {n_trials} trials.
+- **Speeds:** the evaluation drew shove speeds uniformly from 0 to
+  0.25 m/s, so 0.25 m/s is its worst case.
+
+Overall {rate_by_speed} of trials fail.
+
+**Forensics.** The {len(diag['forensics'])} worst moments are replayed on CPU
+MuJoCo with each one's worst direction. Every contact force on every robot
+part is logged, along with every control step a joint spent at its torque
+limit.
+
+## Findings
+
+1. **A shove is rarely fatal; the evaluation just shoves a lot.** On the
+   nominal robot, {per_shove:.2%} of single shoves fail, averaged over the
+   speeds above. The round-trip evaluation shoves every 4–10 s, about
+   {n_shoves:.0f} times per {T / 60:.1f}-minute trip. At this rate
+   (1 − {per_shove:.4f})^{n_shoves:.0f} ≈ {surv:.0%} of trips would survive,
+   consistent with the 74.5% measured (that also has randomized masses,
+   gains and latency). Reaching 95% of trips at this shove rate needs
+   under {need:.3%} failures per shove, about {per_shove / need:.0f}× better
+   than now.
+2. **Fragile moments are where the trunk pitches steeper than the stairs.**
+   On the flights, shoves fail {frac_v[shallow].mean():.2%} of the time below
+   40° of trunk pitch and {frac_v[steep].mean():.2%} at 40° or more
+   ({steep.sum()} of {on_flight.sum()} moments). The stair slope is
+   {math.degrees(s.slope):.1f}°.
+   - **40–50° moments** are spread through the flights' interiors. They are
+     part of the normal climbing rhythm, and fail at a few percent.
+   - **Above 50°** (the worst band) the moments are only at the transitions:
+     entering each flight from the floor or landing, and the top of the
+     lower flight. Their mirrors on the way down are fragile too.
+
+   A downhill (backward) shove is the dangerous direction.
+3. **Two failure modes, and neither is a lack of torque.**
+   - **Tipping backward** (3 of 4 replays). Trunk error grows smoothly from
+     the shove; no joint reaches its torque limit, and nothing but the feet
+     touches the stairs, until the robot is already falling. Once the
+     centre of mass is behind the rear feet, joint torque can't bring it
+     back: only stepping can. The policy is tied to the reference's footstep
+     timing, so it cannot step to recover.
+   - **Delayed thigh strike** (1 of 4). The robot absorbs the shove with
+     about 5 cm of error. Its next swing, still following the reference
+     swing path from the wrong place, drives a thigh into a nosing about 3 s
+     later. The swing paths are collision-free only from the planned pose,
+     and the policy has no view of the stairs.
+4. **The landing is immune.** No shove on the landing failed, whatever the
+   legs were doing.
+
+## What to change
+
+- **Cap the trunk pitch in the plan, near the stair slope.** The planner
+  picks front and rear hip heights independently and can pitch the trunk
+  past 50°. A limit (or a cost) there removes the worst moments at the
+  source. Whether a cap near 40° still finds plans through the transitions
+  is the open question; 16 cm legs were chosen as the shortest that pass, so
+  the margin may be thin. Re-plan, rebuild the reference, retrain.
+- **Let the policy see the stairs.** A height scan around each foot, from
+  the M4 depth camera on the real robot, lets the policy fix a swing that
+  starts from the wrong place. That covers the thigh strike.
+- **Train harder where it fails.** Sample more training episodes around
+  steep moments and shove more often there.
+- **Set the disturbance requirement deliberately.** About {n_shoves:.0f}
+  shoves per trip is far more than a house will deliver (pets, people
+  brushing past). The 95% target means something only against a stated
+  disturbance rate.
+
+## Shove map
+
+![]({f_map})
+
+![]({f_break})
+
+![]({f_pitch})
+
+## Forensic replays
+
+{chr(10).join(sections)}
+"""
+    (d / "report.md").write_text(md)
+    return d
+
+
+def cmd_pitch_cap() -> Path:
+    """M0 step 3e: does capping trunk pitch (to stop backward tip-overs) need a bigger robot?"""
+    import json
+
+    from cleandog_sim import viz
+
+    viz.style()
+    src = latest("*_pitch-cap/results.json").parent
+    data = json.loads((src / "results.json").read_text())
+    rows, caps = data["rows"], data["caps"]
+    scen = sorted({r["scenario"] for r in rows})
+    f_grid = save(viz.fig_pitch_cap_grid(rows, caps, scen), src, "pitch_cap_grid.png")
+    by = {}
+    for r in rows:
+        by.setdefault((r["seg"], r["hip_spacing"], r["cap"]), []).append(r)
+    table = []
+    for (seg, hs, cap), rs in sorted(by.items(), key=lambda kv: (kv[0][0], kv[0][1], -(kv[0][2] or 1e9))):
+        ok = [r for r in rs if r["status"] == "ok"]
+        st = ", ".join(f"{r['scenario']}: {r['status']}" for r in sorted(rs, key=lambda r: r["scenario"])
+                       if r["status"] != "ok")
+        pk = max((r["max_pitch"] for r in ok), default=float("nan"))
+        table.append(f"| {seg * 100:.0f} cm | {hs * 100:.1f} cm | {'none' if cap is None else f'{cap:.1f}°'} | "
+                     f"{len(ok)}/4 | {pk:.0f}° | {st or '–'} |")
+    md = f"""# Capping trunk pitch: does it need a bigger robot? (M0 step 3e)
+
+Generated {dt.datetime.now():%Y-%m-%d %H:%M} by `scripts/visualize.py pitch_cap`, from
+`{src.name}/results.json` (`scripts/pitch_cap_sweep.py`).
+
+## Why
+
+The shove analysis (`*_rl-failures/report.md`) found that shoves tip the robot
+backward where its trunk pitches steeper than the stairs. Shoves fail
+0.35% of the time below 40° and up to 8.7% above 50°. The step-1 planner
+chooses front and rear hip heights independently and can pitch the trunk to
+about 53°. Capping the pitch removes those moments, but if it needs longer
+legs, the robot grows.
+
+## Method
+
+The step-1 quasi-static planner is rerun on the four uphill-facing transitions
+the round trip uses. Its rules (reach, link clearance, 2 cm stability margin,
+verified swing paths) are unchanged, with one added constraint: |trunk pitch|
+≤ cap at every pose.
+- **Robots:** knees back; legs 16–20 cm; hips 25 and 29.2 cm apart.
+- **Search budget:** {data['budget']} expansions and {data['time_limit']:.0f} s per plan. That is
+  {data['time_limit'] / 90:.1f}× the step-1 sweep's time limit, so a failure here is stronger
+  evidence.
+- **Failures:** "no plan within discretisation" means the search tried every
+  option it has. "Search budget exhausted" is unresolved.
+
+![]({f_grid.split('/')[-1] if '/' in f_grid else f_grid})
+
+## Conclusion
+
+- **Capping at the stair slope needs no bigger robot.** The chosen 16 cm /
+  25 cm robot plans all four uphill transitions with |pitch| ≤ 42.4°. Planned
+  over each whole flight (the round-trip reference's form) it also succeeds:
+  lower flight 78 moves (77 uncapped), upper 68 (70), steepest pitch 40.9°.
+- **No size gets below the slope.** At 40° and 35° every robot, 20 cm legs
+  included, fails the top transitions with "no valid start pose": it can't
+  even stand mid-flight. Mid-flight the trunk lies along the stairs, so its
+  pitch is the stair slope. That is geometry, not size.
+- **Expected effect:** the cap removes the moments steeper than the slope.
+  - On the flights those were 11% of moments, and 6.85% of 0.25 m/s shoves
+    there failed. Between 40° and the slope it was 1.45%, and below 40° 0.35%.
+  - If capped moments behaved like the 40–42.4° band, flight shove failures
+    would roughly halve (about 1.4% to 0.8%). That is an estimate: the capped
+    plan is a different motion, and only a retrained policy measures it.
+- **What the cap leaves:** the 40–42.4° band is still about 4× more fragile
+  than shallower poses. Training harder there is the complement.
+
+| Legs | Hip spacing | Cap | Planned | Steepest pitch used | Failures |
+| --- | --- | --- | --- | --- | --- |
+{chr(10).join(table)}
+"""
+    (src / "report.md").write_text(md)
+    return src
+
+
 # ---------------------------------------------------------------- interactive
 
 def cmd_view(args) -> None:
@@ -1073,7 +1380,7 @@ def cmd_view(args) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "rl", "all"):
+    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "rl", "rl_failures", "pitch_cap", "all"):
         sub.add_parser(name)
     v = sub.add_parser("view")
     v.add_argument("--ladder", nargs=2, type=float, metavar=("SEG_CM", "GAP_CM"),
@@ -1085,7 +1392,8 @@ def main(argv=None) -> int:
         cmd_view(args)
         return 0
     cmds = {"stairs": cmd_stairs, "ladder": cmd_ladder, "bins": cmd_bins, "transitions": cmd_transitions,
-            "dynamics": cmd_dynamics, "rl": cmd_rl}
+            "dynamics": cmd_dynamics, "rl": cmd_rl, "rl_failures": cmd_rl_failures,
+            "pitch_cap": cmd_pitch_cap}
     for name in (cmds if args.cmd == "all" else [args.cmd]):
         print(f"{name}: {cmds[name]()}/report.md")
     return 0

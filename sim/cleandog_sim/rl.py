@@ -253,6 +253,9 @@ class StairTrack(mjx_env.MjxEnv):
             last_touch=jp.ones(4, bool),
             # Per joint over the last control step, for the actuator check.
             tau_peak=jp.zeros(self.action_size), tau_ms=jp.zeros(self.action_size), qd=qpos[7:] * 0,
+            # A scheduled shove for diagnostics: at step `forced_push_step` (-1: never), add
+            # `forced_push` (m/s, world x-y) to the trunk velocity.
+            forced_push_step=jp.array(-1, jp.int32), forced_push=jp.zeros(2),
         )
         obs = self._obs(data, info, t0)
         metrics = {k: jp.zeros(()) for k in ("pos_err", "rot_err", "feet_err", "joint_err", "torque_sq",
@@ -284,6 +287,8 @@ class StairTrack(mjx_env.MjxEnv):
         ang = jax.random.uniform(kp1, (), minval=0, maxval=2 * jp.pi)
         spd = jax.random.uniform(kp2, (), minval=cfg.push.speed[0], maxval=cfg.push.speed[1])
         dv = jp.where(push, spd, 0.0) * jp.array([jp.cos(ang), jp.sin(ang)])
+        forced = info["steps"].astype(jp.int32) == info["forced_push_step"]
+        dv = dv + jp.where(forced, 1.0, 0.0) * info["forced_push"]
         data = data.replace(qvel=data.qvel.at[0:2].add(dv))
         info["push_timer"] = jp.where(push, jax.random.uniform(kp3, (), minval=cfg.push.interval[0],
                                                                maxval=cfg.push.interval[1]), info["push_timer"])

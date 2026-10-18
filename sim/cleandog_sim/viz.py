@@ -789,3 +789,142 @@ def fig_engine_agreement(dt: float, traces: dict[str, np.ndarray], segments: lis
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=8, ncol=3)
     ax.set_title("Same policy, nominal robot: MJX/Warp (training engine) vs CPU MuJoCo at two timesteps", fontsize=10)
     return fig
+
+
+# ---------------------------------------------------------------- M0 step 3d: shove failures
+
+def fig_shove_map(times: np.ndarray, frac: dict[float, np.ndarray], segments: list[dict], eval_fail_s: np.ndarray):
+    """Failure fraction (over shove directions) against the moment of the shove, one panel per speed."""
+    speeds = sorted(frac)
+    fig, axes = plt.subplots(len(speeds), 1, figsize=(12, 1.9 + 1.6 * len(speeds)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, v in zip(axes, speeds):
+        ax.fill_between(times, 0, frac[v] * 100, color=SERIES[0], alpha=0.35, lw=0, step="mid")
+        ax.plot(times, frac[v] * 100, color=SERIES[0], lw=0.8, drawstyle="steps-mid")
+        shade_segments(ax, segments, label=ax is axes[0])
+        ax.set_ylim(0, 112)
+        ax.set_ylabel(f"{v:.2f} m/s shove\nfails (% of dirs)")
+    if len(eval_fail_s):
+        axes[-1].plot(eval_fail_s, np.full(len(eval_fail_s), 104), "|", color=TEXT, ms=9,
+                      label="failures in the randomized round trips")
+        axes[-1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.32), fontsize=8)
+    axes[-1].set_xlim(times[0], times[-1])
+    axes[-1].set_xlabel("moment of the shove, along the round trip (s)")
+    axes[0].set_title("Where a single shove makes the nominal robot fail (8 directions per moment)", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def fig_shove_breakdown(phase_rates: dict[str, tuple[int, int]], dir_rates: dict[str, tuple[int, int]],
+                        speed: float):
+    """Failure rate by gait phase at the shove, and by shove direction relative to the trunk."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.3), gridspec_kw=dict(width_ratios=[1.2, 1]))
+    for ax, rates, title in ((axes[0], phase_rates, "by what the legs are doing"),
+                             (axes[1], dir_rates, "by shove direction (relative to the trunk)")):
+        names = list(rates)
+        y = np.arange(len(names))
+        r = np.array([k / n * 100 if n else 0 for k, n in rates.values()])
+        ax.barh(y, r, height=0.55, color=SERIES[0])
+        for yi, (k, n), ri in zip(y, rates.values(), r):
+            ax.text(ri + 0.15, yi, f"{ri:.1f}%  ({k}/{n})", va="center", fontsize=8)
+        ax.set_yticks(y, names)
+        ax.invert_yaxis()
+        ax.set_xlim(0, max(r.max() * 1.4, 10))
+        ax.set_xlabel("trials that fail (%)")
+        ax.grid(axis="y", visible=False)
+        ax.set_title(f"{speed:.2f} m/s shoves {title}", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def fig_forensic(dt: float, lead: int, pos_err: np.ndarray, forces: np.ndarray, names: list[str],
+                 saturated: np.ndarray, joints: list[str], title: str, term: float):
+    """One shoved moment replayed on CPU MuJoCo: trunk error, contact forces on non-foot parts, and
+    torque-limit hits per joint."""
+    t = (np.arange(len(pos_err)) - lead) * dt
+    fig, axes = plt.subplots(3, 1, figsize=(11, 6.6), sharex=True, gridspec_kw=dict(height_ratios=[1, 1.2, 1.3]))
+    axes[0].plot(t, pos_err * CM, color=SERIES[0], lw=1.3)
+    axes[0].axhline(term * CM, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    axes[0].set_ylabel("trunk from\nreference (cm)")
+    axes[0].set_ylim(0, max(term * CM * 1.2, np.nanmax(pos_err) * CM * 1.05))
+    # Non-foot contacts first: those are the unplanned ones. Then the four feet, for context.
+    order = sorted(range(len(names)), key=lambda i: (names[i].split("|")[0].endswith("_foot"), -forces[:, i].max()))
+    shown = [i for i in order if not names[i].split("|")[0].endswith("_foot")][:4]
+    for k, i in enumerate(shown):
+        axes[1].plot(t, forces[:, i], color=SERIES4[k], lw=1.1, label=_contact_label(names[i]))
+    if not shown:
+        axes[1].text(0.5, 0.5, "no contact on any part but the feet", transform=axes[1].transAxes, ha="center",
+                     color=TEXT_2)
+    axes[1].set_ylabel("normal force (N)\nnon-foot contacts")
+    if shown:
+        axes[1].legend(loc="upper left", fontsize=8)
+    rows = [j for j in range(saturated.shape[1]) if saturated[:, j].any()] or [0]
+    img = saturated[:, rows].T.astype(float)
+    axes[2].imshow(img, aspect="auto", cmap=LinearSegmentedColormap.from_list("sat", [SURFACE, SERIES[1]]),
+                   extent=(t[0], t[-1], len(rows) - 0.5, -0.5), interpolation="nearest", vmin=0, vmax=1)
+    axes[2].set_yticks(range(len(rows)), [joints[j] for j in rows])
+    axes[2].set_ylabel("at torque limit")
+    axes[2].grid(False)
+    for ax in axes:
+        ax.axvline(0, color=TEXT, lw=0.9)
+    axes[0].text(0, axes[0].get_ylim()[1], " shove", va="top", fontsize=8)
+    axes[2].set_xlabel("time from the shove (s)")
+    axes[0].set_title(title, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def _contact_label(name: str) -> str:
+    robot, world = name.split("|")
+    if world == "floor":
+        return f"{robot} on the floor"
+    return f"{robot} on the stairs ({world})" if world.startswith("world") else f"{robot} on {world}"
+
+
+def fig_shove_vs_pitch(edges: list[float], rates: np.ndarray, counts: np.ndarray, slope_deg: float, speed: float):
+    """Shove failure rate on the flights, binned by the reference trunk pitch at the shove."""
+    fig, ax = plt.subplots(figsize=(7.5, 3.2))
+    mids = (np.array(edges[:-1]) + np.array(edges[1:])) / 2
+    widths = np.diff(edges) * 0.85
+    ax.bar(mids, rates * 100, width=widths, color=SERIES[0])
+    for m, r, n in zip(mids, rates, counts):
+        if n:
+            ax.text(m, r * 100 + 0.2, f"{r * 100:.1f}%\n({n} moments)", ha="center", va="bottom", fontsize=7.5)
+    ax.set_ylim(0, max(rates.max() * 100 * 1.35, 1))
+    ax.axvline(slope_deg, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    ax.text(slope_deg - 0.6, ax.get_ylim()[1] * 0.62, f"stair slope {slope_deg:.1f}°", ha="right", fontsize=8,
+            color=TEXT_2)
+    ax.set_xlabel("reference trunk pitch at the shove (degrees, nose up)")
+    ax.set_ylabel("trials that fail (%)")
+    ax.grid(axis="x", visible=False)
+    ax.set_title(f"{speed:.2f} m/s shoves on the flights: a trunk steeper than the stairs is fragile", fontsize=10)
+    return fig
+
+
+def fig_pitch_cap_grid(rows: list[dict], caps: list, scenarios: list[str]):
+    """Rows: morphologies (leg length, hip spacing); columns: pitch caps. Cell: transitions planned
+    out of the four uphill-facing ones; '?' marks searches that ran out of budget."""
+    morphs = sorted({(r["seg"], r["hip_spacing"]) for r in rows})
+    cap_key = lambda c: 1e9 if c is None else c  # noqa: E731
+    caps = sorted(caps, key=cap_key, reverse=True)
+    grid = np.zeros((len(morphs), len(caps)))
+    unknown = np.zeros_like(grid)
+    for r in rows:
+        i, j = morphs.index((r["seg"], r["hip_spacing"])), caps.index(r["cap"])
+        grid[i, j] += r["status"] == "ok"
+        unknown[i, j] += r["status"] == "search budget exhausted"
+    fig, ax = plt.subplots(figsize=(1.3 * len(caps) + 3.2, 0.48 * len(morphs) + 1.6))
+    ax.imshow(grid, cmap=BLUES, vmin=0, vmax=len(scenarios), aspect="auto")
+    for i in range(len(morphs)):
+        for j in range(len(caps)):
+            n = int(grid[i, j])
+            txt = f"{n}/{len(scenarios)}" + (f"  ({int(unknown[i, j])}?)" if unknown[i, j] else "")
+            ax.text(j, i, txt + (" ✓" if n == len(scenarios) else ""), ha="center", va="center", fontsize=8.5,
+                    color="white" if n >= len(scenarios) - 1 else TEXT, fontweight="bold" if n == len(scenarios) else None)
+    ax.set_xticks(range(len(caps)), ["no cap" if c is None else f"{c:.1f}°" for c in caps])
+    ax.set_yticks(range(len(morphs)), [f"{s * CM:.0f} cm legs, hips {h * CM:.1f} cm apart" for s, h in morphs])
+    ax.set_xlabel("cap on |trunk pitch|  (stair slope 42.4°)")
+    ax.grid(False)
+    ax.set_title("Uphill transitions planned (of 4) with the trunk pitch capped; knees back. "
+                 "(n?) = searches that ran out of budget", fontsize=10)
+    return fig

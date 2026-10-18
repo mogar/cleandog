@@ -29,6 +29,8 @@ python scripts/rl_reference.py            # plan both whole flights, build the r
 python scripts/rl_train.py                # PPO tracking policy on MJX/Warp, 4096 envs (~1 h for 400M steps)
 python scripts/rl_eval.py                 # whole round trips: randomized, nominal, friction sweep, CPU MuJoCo cross-check
 python scripts/visualize.py rl            # report, written into the same outputs/<date>_rl folder
+python scripts/rl_diagnose.py             # shove map along the trip + CPU forensic replays of the worst moments
+python scripts/visualize.py rl_failures   # failure-analysis report
 
 python scripts/ladder_sweep.py            # the sweep as text tables (--csv out.csv)
 python scripts/build_models.py            # write MJCF scenes to sim/models/

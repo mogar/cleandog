@@ -117,8 +117,16 @@ def full_flight_scenario(p: RobotParams, s: StairParams, flight: str):
     return dataclasses.replace(sc, goal_sids=(sc.n_risers,))
 
 
+def flight_planner(p: RobotParams, s: StairParams, flight: str) -> Planner:
+    """Whole-flight planner with |trunk pitch| capped at the stair slope. Shoves tip the robot
+    backward where the trunk is steeper than the stairs, and the cap costs nothing for the
+    16 cm robot (M0 step 3e, outputs/*_pitch-cap). It can't go lower: mid-flight the trunk
+    lies along the stairs."""
+    return Planner(p, full_flight_scenario(p, s, flight), budget=20000, max_pitch=s.slope)
+
+
 def plan_flight(p: RobotParams, s: StairParams, flight: str, time_limit: float = 1800.0):
-    pl = Planner(p, full_flight_scenario(p, s, flight), budget=20000)
+    pl = flight_planner(p, s, flight)
     path, status = pl.plan(time_limit=time_limit)
     return pl, path, status
 
@@ -430,7 +438,7 @@ def round_trip(p: RobotParams, s: StairParams, paths: dict[str, list], dt: float
     model = pin_model(p)
     flights = {}
     for fl in ("lower", "upper"):
-        pl = Planner(p, full_flight_scenario(p, s, fl), budget=20000)
+        pl = flight_planner(p, s, fl)
         flights[fl] = flight_reference(p, s, model, pl, paths[fl], fl, dt)
     crawl = LandingCrawl(p, s, model, dt)
     landing = crawl.run(mj_to_pin(flights["lower"].qpos[-1]), mj_to_pin(flights["upper"].qpos[0]))

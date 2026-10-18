@@ -123,8 +123,14 @@ def mjx_trips(env, policy, n_trips: int, seed: int, randomize: bool, foot_fricti
                 traces=tr)
 
 
-def cpu_trip(env_nominal, policy, timestep: float, record_every: int = 5, n_steps: int | None = None):
-    """The nominal round trip in CPU MuJoCo with the same observation code and PD law."""
+def cpu_trip(env_nominal, policy, timestep: float, record_every: int = 5, n_steps: int | None = None,
+             start: int = 0, push: tuple[int, np.ndarray] | None = None, log_contacts: bool = False):
+    """The nominal round trip in CPU MuJoCo with the same observation code and PD law.
+
+    `start` is the reference frame to begin at; `push` = (step, (vx, vy)) adds a shove to the
+    trunk velocity at that step. With `log_contacts`, every control step records the normal
+    force on each robot geom (by name) and which joints sat at their torque limit.
+    """
     import jax
     import mujoco
 
@@ -133,9 +139,9 @@ def cpu_trip(env_nominal, policy, timestep: float, record_every: int = 5, n_step
     env = env_nominal
     m = mujoco.MjModel.from_xml_string(rl_scene_xml(env.p, env.s, timestep))
     d = mujoco.MjData(m)
-    d.qpos[:] = env.ref.qpos[0]
+    d.qpos[:] = env.ref.qpos[start]
     d.qpos[2] += 0.003
-    d.qvel[:] = env.ref.qvel[0]
+    d.qvel[:] = env.ref.qvel[start]
     mujoco.mj_forward(m, d)
 
     class D:  # the fields StairTrack._obs reads
@@ -155,32 +161,53 @@ def cpu_trip(env_nominal, policy, timestep: float, record_every: int = 5, n_step
     n_sub = int(round(env._config.ctrl_dt / timestep))
     last_act = np.zeros(env.action_size, np.float32)
     rng = jax.random.PRNGKey(0)
-    pos_err = np.zeros(env.N)
-    tau_peak = np.zeros((env.N, env.action_size))
-    tau_ms = np.zeros((env.N, env.action_size))
-    qd_log = np.zeros((env.N, env.action_size))
-    qpos_log = []
-    t0 = time.time()
     n_steps = env.N if n_steps is None else n_steps
+    pos_err = np.zeros(n_steps)
+    tau_peak = np.zeros((n_steps, env.action_size))
+    tau_ms = np.zeros((n_steps, env.action_size))
+    qd_log = np.zeros((n_steps, env.action_size))
+    saturated = np.zeros((n_steps, env.action_size), bool)
+    contacts = []
+    qpos_log = []
+    robot_geoms = {g for g in range(m.ngeom) if m.body_rootid[m.geom_bodyid[g]] == m.body("trunk").id}
+    gname = [m.geom(g).name or f"world{g}" for g in range(m.ngeom)]
+    force = np.zeros(6)
+    t0 = time.time()
     for i in range(n_steps):
+        k = (start + i) % env.N
+        if push is not None and i == push[0]:
+            d.qvel[0:2] += push[1]
         obs = obs_fn(d.qpos.astype(np.float32), d.qvel.astype(np.float32), d.sensordata.astype(np.float32),
-                     d.site_xpos.astype(np.float32), last_act, rng, i)
+                     d.site_xpos.astype(np.float32), last_act, rng, k)
         a, _ = policy(jax.tree.map(lambda x: x[None], obs), rng)
         a = np.asarray(a[0])
-        target = np.clip(env.ref.qpos[(i + 1) % env.N, 7:] + env._config.action_scale * a, lo, hi)
+        target = np.clip(env.ref.qpos[(k + 1) % env.N, 7:] + env._config.action_scale * a, lo, hi)
         taus = []
         for _ in range(n_sub):
             q, qd = d.qpos[7:], d.qvel[6:]
             tau = kp * (target - q) - kd * qd
             lim = acts_peak * np.clip(1 - np.abs(qd) / max_speed, 0, 1)
+            saturated[i] |= np.abs(tau) >= lim * 0.999
             tau = np.clip(tau, -lim, lim)
             d.ctrl[:] = tau
             mujoco.mj_step(m, d)
             taus.append(tau)
         taus = np.array(taus)
         tau_peak[i], tau_ms[i], qd_log[i] = np.abs(taus).max(0), (taus**2).mean(0), d.qvel[6:]
+        if log_contacts:
+            step_c = {}
+            for c_i in range(d.ncon):
+                c = d.contact[c_i]
+                g = c.geom1 if c.geom1 in robot_geoms else c.geom2
+                other = c.geom2 if g == c.geom1 else c.geom1
+                if g not in robot_geoms:
+                    continue
+                mujoco.mj_contactForce(m, d, c_i, force)
+                key = f"{gname[g]}|{gname[other]}"
+                step_c[key] = max(step_c.get(key, 0.0), float(force[0]))
+            contacts.append(step_c)
         last_act = a.astype(np.float32)
-        j = (i + 1) % env.N
+        j = (k + 1) % env.N
         pos_err[i] = np.linalg.norm(d.qpos[:3] - env.ref.qpos[j, :3])
         if i % record_every == 0:
             qpos_log.append(d.qpos.copy())
@@ -190,7 +217,7 @@ def cpu_trip(env_nominal, policy, timestep: float, record_every: int = 5, n_step
     pos_err = pos_err[:n_steps]
     failed = np.flatnonzero(pos_err > cfg.term_pos)
     return dict(pos_err=pos_err, tau_peak=tau_peak, tau_ms=tau_ms, qd=qd_log, qpos=np.array(qpos_log),
-                record_every=record_every, failed_at=int(failed[0]) if len(failed) else -1,
+                saturated=saturated, contacts=contacts, record_every=record_every, failed_at=int(failed[0]) if len(failed) else -1,
                 success=bool(len(failed) == 0 and pos_err[-1] < 0.05), seconds=time.time() - t0)
 
 
@@ -261,7 +288,7 @@ def main(argv=None) -> int:
             print(f"  {name}: {'ok' if c['success'] else 'FAILED at ' + str(c['failed_at'])}, "
                   f"{c['seconds']:.0f} s", flush=True)
             tag = f"cpu{ts * 1000:g}".replace(".", "p")
-            arrays.update({f"{tag}_{k}": v for k, v in c.items() if isinstance(v, np.ndarray)})
+            arrays.update({f"{tag}_{k}": v for k, v in c.items() if isinstance(v, np.ndarray) and k != "saturated"})
 
     np.savez_compressed(out / f"eval_{args.tag}.npz", **arrays)
     (out / f"eval_{args.tag}.json").write_text(json.dumps(dict(

@@ -157,8 +157,11 @@ class Poses:
 
 class Planner:
     def __init__(self, p: RobotParams, sc: Scenario, margin: float = 0.02,
-                 n_heights: int = 7, budget: int = 1500, max_sway: float = 0.05):
+                 n_heights: int = 7, budget: int = 1500, max_sway: float = 0.05, max_pitch: float | None = None):
         self.p, self.sc, self.t, self.margin, self.budget = p, sc, sc.terrain, margin, budget
+        # Optional cap on |trunk pitch| (rad). Shoves tip the robot backward where the trunk is
+        # steeper than the stairs (M0 step 3d), so a cap trades reach for robustness.
+        self.max_pitch = max_pitch
         # Hip heights above the stepped terrain envelope (nosing line on the flight, floor or
         # landing elsewhere): from belly 1 cm above it up to 95% of leg reach. Front and rear
         # are chosen independently.
@@ -314,6 +317,8 @@ class Planner:
 
         Returns (ok (N,), info dict)."""
         ok = self.trunk_clear(P)
+        if self.max_pitch is not None:
+            ok &= np.abs(P.pitch) <= self.max_pitch
         feas = self.neck_feasible(P)
         ok &= feas.any(axis=1)
         knees = {}

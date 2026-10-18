@@ -182,7 +182,7 @@ Use MuJoCo as the single physics world, with MJCF as the source of truth for the
 ### Workflow
 
 1. **Parametric robot generator.** A Python script emits MJCF and URDF from about ten parameters: segment lengths, hip spacing, body size, masses, skid plate, and an actuator model. The actuator model covers torque-speed curve, current limit, thermal model, friction and latency. M1 measurements replace the datasheet guesses.
-2. **Your stairwell as a model.** Exact geometry: 8 steps, landing, 7 steps, rounded nosings, hardwood friction. Add randomized variants (rise 17–20 cm, tread 21–28 cm, friction 0.3–0.8) so policies don't overfit.
+2. **Your stairwell as a model.** Exact geometry: 8 steps, landing, 7 steps, rounded nosings, hardwood friction. Add randomized variants (rise 17–20 cm, tread 21–28 cm, friction 0.3–0.8, and landings turning either way) so policies don't overfit. The left turn modelled now is fine for M0; validating both directions comes with the stair-dimension variants.
 3. **Feasibility sweep (Crocoddyl).** Climb one step in ladder posture across the size grid. This prunes infeasible sizes.
 4. **RL on the survivors.** Train flat walking, stair ascent, and stair descent (rear-first vs head-first). Rewards penalize touchdown velocity for noise and torque-squared for heat.
 5. **Pick the morphology.** Choose the smallest one with ≥ 95% round-trip success on randomized stairs and ≥ 30% torque margin.
@@ -218,7 +218,21 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
       - nominal robot: 4/4 trips, with CPU MuJoCo at 4 ms and 2 ms agreeing;
       - all randomization except shoves: 303/320 (94.7%, CI 91.7–96.7%), flat across foot friction 0.3–0.8;
       - with 0–0.25 m/s shoves every 4–10 s: 149/200 (74.5%).
-    - **Failure spots:** failures recur at a few fixed spots, mostly on the lower flight and in both directions. They are not where the static margin is lowest. Diagnosing them is next.
+    - **Failure spots:** failures recur at a few fixed spots, mostly on the lower flight and in both directions. They are not where the static margin is lowest.
+    - **Diagnosis (2026-10-18):**
+      - **Per shove:** one shove fails the nominal robot 0.47% of the time. The evaluation shoves about 117 times per trip, which predicts about 58% of trips surviving. 95% at that rate needs 11× fewer failures per shove.
+      - **Where:** on the flights, shoves fail 0.35% of the time below 40° of trunk pitch and 2.96% at 40° or more (8.7% above 50°, which happens only at the transitions). The stair slope is 42.4°.
+      - **How:** mostly a backward tip-over with no joint at its torque limit; the reference-locked policy can't step to recover. Sometimes the next swing drives a thigh into a nosing.
+      - **Not a factor:** shoves on the landing never fail.
+    - **Pitch cap (2026-10-18): no bigger robot needed.**
+      - **16 cm robot:** with |trunk pitch| capped at the stair slope (42.4°), the 16 cm / 25 cm robot still plans all four uphill transitions and both whole flights (steepest 40.9°).
+      - **Below the slope:** no size, up to 20 cm legs, plans below the slope. Mid-flight the trunk has to lie along the stairs.
+      - **Effect:** the cap removes the moments where 6.85% of shoves failed, against 1.45% just below the slope.
+    - **Next:**
+      - adopted (2026-10-18): the round-trip reference now plans with the 42.4° cap (`reference.flight_planner`); retrain on it;
+      - give the policy a height scan of the stairs;
+      - train harder at the steep moments;
+      - set the disturbance rate the 95% target is measured against.
   - **Correction:** the step-1 planner's 5 cm sway ignores the ±0.6 rad ab/ad limit. The reference cuts sway where 3D IK can't reach it, and the 3D static margin stays positive everywhere (min 0.35 cm). The planner should check ab/ad limits itself.
   - **Closed-loop torque:** on the nominal trip the closed-loop peaks (knee 12.1, hip 8.7, ab/ad 4.5 Nm) fit the actuators with the 30% margin and agree with Crocoddyl. Recovering from shoves saturates the knee and hip at 17 Nm.
   - **Morphology:** 16 cm thigh and shin, knees backward, hip spacing 25 cm, trunk about 38 × 22 cm, 8.5 kg budget.

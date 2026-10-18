@@ -38,6 +38,7 @@ python scripts/transition_sweep.py && python scripts/visualize.py transitions   
 python scripts/dynamics_run.py && python scripts/visualize.py dynamics          # M0 step 2 (~1 min)
 python scripts/rl_reference.py && python scripts/rl_train.py                    # M0 step 3 (GPU, ~1 h)
 python scripts/rl_eval.py && python scripts/visualize.py rl                     # round trips (~25 min)
+python scripts/rl_diagnose.py && python scripts/visualize.py rl_failures        # shove map + forensics (~10 min)
 ```
 
 Compute-heavy steps write their data (JSON/NPZ) into `outputs/`, and the

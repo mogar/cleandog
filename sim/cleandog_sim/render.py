@@ -81,18 +81,28 @@ def planner_to_world_qpos(q_pin: np.ndarray, s, flight: str, facing: str) -> np.
 
 def render_trajectory_gif(model: mujoco.MjModel, qpos_traj: np.ndarray, out_file, dt: float, every: float = 0.25,
                           size=(360, 640), azimuth: float = 120, elevation: float = -20, distance: float = 1.6,
-                          fps: int = 12) -> int:
-    """Kinematic replay of a trajectory as a GIF, camera following the trunk. Returns frame count."""
+                          fps: int = 12, smooth: float = 12.0) -> int:
+    """Kinematic replay of a trajectory as a GIF, camera following the trunk. Returns frame count.
+
+    The camera target is the trunk position averaged over a `smooth`-second window, so
+    the view glides with the robot's progress instead of copying every sway and step.
+    """
     data = mujoco.MjData(model)
     step = max(1, int(round(every / dt)))
+    pos = np.asarray(qpos_traj)[:, :3]
+    half = max(0, int(round(smooth / dt / 2)))
+    padded = np.concatenate([np.repeat(pos[:1], half, 0), pos, np.repeat(pos[-1:], half, 0)])
+    kernel = np.hanning(2 * half + 3)[1:-1] if half else np.ones(1)
+    kernel /= kernel.sum()
+    lookat = np.stack([np.convolve(padded[:, c], kernel, mode="valid") for c in range(3)], 1)
     images = []
     with mujoco.Renderer(model, *size) as renderer:
         cam = mujoco.MjvCamera()
         cam.distance, cam.azimuth, cam.elevation = distance, azimuth, elevation
-        for q in qpos_traj[::step]:
+        for q, target in zip(qpos_traj[::step], lookat[::step]):
             data.qpos[:] = q
             mujoco.mj_forward(model, data)
-            cam.lookat[:] = q[:3]
+            cam.lookat[:] = target
             renderer.update_scene(data, cam)
             images.append(Image.fromarray(renderer.render()))
     images[0].save(out_file, save_all=True, append_images=images[1:], duration=int(1000 / fps), loop=0)

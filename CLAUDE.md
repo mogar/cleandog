@@ -36,6 +36,8 @@ conda activate cleandog
 cd sim && python scripts/visualize.py stairs|ladder|bins   # fast, self-contained reports
 python scripts/transition_sweep.py && python scripts/visualize.py transitions   # M0 step 1 (~35 min)
 python scripts/dynamics_run.py && python scripts/visualize.py dynamics          # M0 step 2 (~1 min)
+python scripts/rl_reference.py && python scripts/rl_train.py                    # M0 step 3 (GPU, ~1 h)
+python scripts/rl_eval.py && python scripts/visualize.py rl                     # round trips (~25 min)
 ```
 
 Compute-heavy steps write their data (JSON/NPZ) into `outputs/`, and the
@@ -53,6 +55,8 @@ iterated without recomputing.
 - The stairwell model is the real one: 8 risers, a 78" × 35" landing with a
   180° turn, then 7 risers, with balusters on the open side of the lower
   flight. The return direction (`turn_left`) is still an assumption.
+- Only one GPU job at a time: training preallocates most of the 3090, and a
+  second job (an eval, a render) caused an out-of-memory crash.
 - Environment: conda env `cleandog` (`environment.yml`). There is no display
   in agent sessions: render offscreen with `MUJOCO_GL=egl`. The interactive
   viewer (`visualize.py view`) is for Morgan's desktop.

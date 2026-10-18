@@ -569,7 +569,8 @@ def fig_torque_traces(t, tau, joints, acts: dict, title: str):
     return fig
 
 
-def fig_actuator_demand(demand: dict, acts: dict):
+def fig_actuator_demand(demand: dict, acts: dict, title: str = "Actuator demand across all planned transitions "
+                        "(worst case), with the 30% margin M0 requires. n× = capability / demand."):
     """Per joint role: worst peak torque, worst RMS torque and worst speed across all transitions,
     each with a 30% margin, against the actuator's capability."""
     roles = ("abad", "hip", "knee")
@@ -591,8 +592,7 @@ def fig_actuator_demand(demand: dict, acts: dict):
         ax.set_xlim(0, max((need * 1.3).max(), cap.max()) * 1.35)
         ax.grid(axis="y", visible=False)
     axes[0].legend(loc="lower right", fontsize=8)
-    fig.suptitle("Actuator demand across all planned transitions (worst case), with the 30% margin M0 requires. "
-                 "n× = capability / demand.", fontsize=10)
+    fig.suptitle(title, fontsize=10)
     fig.tight_layout()
     return fig
 
@@ -606,4 +606,186 @@ def fig_friction_use(t, fric, mu: float, title: str):
     ax.set_xlabel("time (s)")
     ax.set_ylabel("max |f_t| / f_n")
     ax.set_title(title, fontsize=10)
+    return fig
+
+
+# ---------------------------------------------------------------- M0 step 3: RL round trips
+
+def _short(name: str) -> str:
+    base = name.replace(" (down, rear-first)", "")
+    arrow = "↓" if "down" in name else ("↑" if "flight" in name else "")
+    return {"lower flight": "lower", "upper flight": "upper"}.get(base, base) + (f" {arrow}" if arrow else "")
+
+
+def shade_segments(ax, segments: list[dict], label: bool = True, ymax_frac: float = 0.98):
+    """Alternate light bands for the round trip's segments (times in seconds), labelled at the top."""
+    for k, sg in enumerate(segments):
+        x0, x1 = sg["start"], sg["start"] + sg["duration"]
+        if k % 2 == 0:
+            ax.axvspan(x0, x1, color=GRID, alpha=0.45, lw=0, zorder=0)
+        if label and sg["duration"] > 20:
+            ax.text((x0 + x1) / 2, ymax_frac, _short(sg["name"]), transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8, color=TEXT_2)
+
+
+def fig_reference_overview(dt: float, margins_every: int, margins: np.ndarray, segments: list[dict]):
+    t = np.arange(len(margins)) * dt * margins_every
+    fig, ax = plt.subplots(figsize=(12, 3.0))
+    ax.plot(t, margins * CM, color=SERIES[0], lw=0.8)
+    ax.axhline(0, color=TEXT_2, lw=0.9)
+    ax.set_ylim(min(-0.5, margins.min() * CM * 1.1), max(margins.max() * CM * 1.15, 5))
+    shade_segments(ax, segments)
+    ax.set_xlim(0, t[-1])
+    ax.set_xlabel("time along the round trip (s)")
+    ax.set_ylabel("static margin (cm)")
+    ax.set_title("Reference: COM distance inside the planted feet's support polygon (3D, top view); > 0 means the "
+                 "pose holds with no dynamics", fontsize=10)
+    return fig
+
+
+def fig_landing_crawl(p: RobotParams, s: StairParams, crawl: list[dict], legs=("FL", "FR", "RL", "RR")):
+    """Top view of the landing: the trunk at every swing, the footholds and the COM path."""
+    lower = s.flights[0]
+    x_top = (lower.n_risers - 1) * s.run
+    x_end = x_top + lower.top_depth
+    ys = 1 if s.turn_left else -1
+    y_lo, y_hi = sorted((-ys * s.width / 2, ys * (s.landing_width - s.width / 2)))
+    fig, ax = plt.subplots(figsize=(7.5, 9.5))
+    ax.add_patch(Rectangle((x_top * CM, y_lo * CM), (x_end - x_top) * CM, (y_hi - y_lo) * CM,
+                           facecolor="none", edgecolor=TEXT_2, lw=1.4))
+    for y0, y1, lab in ((-s.width / 2, s.width / 2, "lower flight (down to the floor)"),
+                        (ys * (s.landing_width - s.width) - s.width / 2, ys * (s.landing_width - s.width) + s.width / 2,
+                         "upper flight (up)")):
+        ax.add_patch(Rectangle(((x_top - 0.45) * CM, y0 * CM), 0.45 * CM, (y1 - y0) * CM, facecolor=STAIR_FILL,
+                               edgecolor="none"))
+        for k in range(3):
+            ax.plot([(x_top - k * s.run) * CM] * 2, [y0 * CM, y1 * CM], color=STAIR_EDGE, lw=0.8)
+        ax.text((x_top - 0.22) * CM, (y0 + y1) / 2 * CM, lab, rotation=90, ha="center", va="center", fontsize=8,
+                color=TEXT_2)
+    hl, hw = p.body_length / 2, p.body_width / 2
+    corners = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+    for i, c in enumerate(crawl):
+        x, y, yaw = c["base"][0], c["base"][1], c["base"][3]
+        R = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+        pts = (corners @ R.T + [x, y]) * CM
+        ax.add_patch(Polygon(pts, closed=True, facecolor=BODY_FILL, edgecolor=LIMB, lw=0.4,
+                             alpha=0.12 if 0 < i < len(crawl) - 1 else 0.5))
+    com = np.array([c["com"] for c in crawl]) * CM
+    ax.plot(com[:, 0], com[:, 1], color=TEXT, lw=1.0, label="centre of mass (at each lift)")
+    for k, leg in enumerate(legs):
+        f = np.array([c["feet"][leg][:2] for c in crawl if c["leg"] == leg]) * CM
+        ax.scatter(f[:, 0], f[:, 1], s=14, color=SERIES4[k], label=f"{leg} footholds", zorder=3)
+    worst = min(range(len(crawl)), key=lambda i: crawl[i]["margin"])
+    c = crawl[worst]
+    tri = np.array([c["feet"][l][:2] for l in legs if l != c["leg"]]) * CM
+    ax.add_patch(Polygon(tri, closed=True, facecolor="none", edgecolor=TEXT, lw=1.0, ls=(0, (3, 2))))
+    ax.annotate(f"tightest support triangle\n(COM {c['margin'] * CM:.1f} cm inside)", tri.mean(0),
+                xytext=(18, -30), textcoords="offset points", fontsize=8, arrowprops=dict(arrowstyle="-", lw=0.6))
+    ax.set_aspect("equal")
+    ax.set_xlim((x_top - 0.5) * CM, (x_end + 0.08) * CM)
+    ax.set_ylim((y_lo - 0.08) * CM, (y_hi + 0.08) * CM)
+    ax.set_xlabel("x (cm, uphill on the lower flight)")
+    ax.set_ylabel("y (cm)")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+    ax.set_title(f"Landing crawl, top view: {len(crawl)} swings, trunk drawn at each", fontsize=10)
+    return fig
+
+
+def fig_training_curve(curve: list[dict], episode_length: int):
+    steps = np.array([r["step"] for r in curve]) / 1e6
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.2))
+    rew = np.array([r.get("eval/episode_reward", np.nan) for r in curve])
+    length = np.array([r.get("eval/avg_episode_length", np.nan) for r in curve])
+    axes[0].plot(steps, rew, color=SERIES[0], lw=1.5, marker="o", ms=3)
+    axes[0].set_ylabel("episode reward")
+    axes[0].set_title("Evaluation reward (128 randomized episodes)", fontsize=10)
+    axes[1].plot(steps, length * CTRL_DT_REPORT, color=SERIES[0], lw=1.5, marker="o", ms=3)
+    axes[1].axhline(episode_length * CTRL_DT_REPORT, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    axes[1].text(steps[0], episode_length * CTRL_DT_REPORT, " episode cap", va="bottom", fontsize=8, color=TEXT_2)
+    axes[1].set_ylabel("survival (s)")
+    axes[1].set_title("Time before the trunk strays from the reference", fontsize=10)
+    for ax in axes:
+        ax.set_xlabel("environment steps (millions)")
+    fig.tight_layout()
+    return fig
+
+
+CTRL_DT_REPORT = 0.02
+
+
+def fig_success(results: dict, sweep_mus: list[float]):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.4), gridspec_kw=dict(width_ratios=[1, 1.3]))
+    names = [n for n in ("nominal", "randomized") if n in results]
+    for i, n in enumerate(names):
+        r = results[n]
+        lo, hi = r.get("ci95", [r["rate"], r["rate"]])
+        axes[0].barh(i, r["rate"] * 100, height=0.5, color=SERIES[0])
+        axes[0].plot([lo * 100, hi * 100], [i, i], color=TEXT, lw=1.2)
+        axes[0].text(2, i, f"{r['success']}/{r['trips']}", va="center", fontsize=8.5, color="white",
+                     fontweight="bold")
+    axes[0].axvline(95, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    axes[0].text(96, -0.45, "95% target", fontsize=8, color=TEXT_2)
+    axes[0].set_yticks(range(len(names)), names)
+    axes[0].set_xlim(0, 115)
+    axes[0].set_xlabel("round trips completed (%), bar = 95% CI")
+    axes[0].grid(axis="y", visible=False)
+    axes[0].set_title("Whole round trips", fontsize=10)
+    rates = np.array([results[f"friction {m:.1f}"]["rate"] for m in sweep_mus]) * 100
+    ci = np.array([results[f"friction {m:.1f}"]["ci95"] for m in sweep_mus]) * 100
+    axes[1].fill_between(sweep_mus, ci[:, 0], ci[:, 1], color=SERIES[0], alpha=0.18, lw=0)
+    axes[1].plot(sweep_mus, rates, color=SERIES[0], lw=1.8, marker="o", ms=5)
+    axes[1].axhline(95, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    axes[1].axvspan(0.4, 1.0, color=GRID, alpha=0.4, lw=0)
+    axes[1].text(0.82, 4, "trained on\nμ 0.4–1.0", fontsize=8, color=TEXT_2, ha="center")
+    axes[1].set_xlim(min(sweep_mus) - 0.03, max(sweep_mus) + 0.03)
+    axes[1].set_ylim(0, 105)
+    axes[1].set_xlabel("foot friction μ (rubber on hardwood), all else randomized, no pushes")
+    axes[1].set_ylabel("round trips completed (%)")
+    axes[1].set_title("Sensitivity to foot friction", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def fig_tracking_along_trip(dt: float, pos_err: np.ndarray, segments: list[dict], failed_at: np.ndarray,
+                            term: float):
+    """pos_err: (T, B) trunk distance from the reference, sampled every dt seconds."""
+    t = np.arange(pos_err.shape[0]) * dt
+    pos_err = pos_err.astype(float).copy()
+    for b, f in enumerate(failed_at):  # a failed trip leaves the statistics once it fails
+        if f >= 0:
+            pos_err[int(f * CTRL_DT_REPORT / dt) + 1:, b] = np.nan
+    fig, ax = plt.subplots(figsize=(12, 3.6))
+    with np.errstate(all="ignore"):
+        q = np.nanpercentile(pos_err, [50, 95, 100], axis=1) * CM
+    ax.fill_between(t, 0, q[1], color=SERIES[0], alpha=0.25, lw=0, label="95th percentile")
+    ax.plot(t, q[0], color=SERIES[0], lw=1.0, label="median")
+    ax.plot(t, q[2], color=SERIES[0], lw=0.5, alpha=0.6, label="worst trip")
+    ax.axhline(term * CM, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    ax.text(t[-1], term * CM, f" failure: {term * CM:.0f} cm", va="center", fontsize=8, color=TEXT_2)
+    f = failed_at[failed_at >= 0] * CTRL_DT_REPORT
+    if len(f):
+        ax.plot(f, np.full(len(f), term * CM * 1.08), "|", color=TEXT, ms=10, label="failures")
+    shade_segments(ax, segments)
+    ax.set_xlim(0, t[-1])
+    ax.set_ylim(0, term * CM * 1.25)
+    ax.set_xlabel("time along the round trip (s)")
+    ax.set_ylabel("trunk from reference (cm)")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=8, ncol=4)
+    ax.set_title(f"Tracking error over {pos_err.shape[1]} randomized round trips (a failed trip drops out "
+                 "when it fails)", fontsize=10)
+    return fig
+
+
+def fig_engine_agreement(dt: float, traces: dict[str, np.ndarray], segments: list[dict]):
+    fig, ax = plt.subplots(figsize=(12, 3.0))
+    for k, (name, y) in enumerate(traces.items()):
+        t = np.arange(len(y)) * dt
+        ax.plot(t, y * CM, color=SERIES[k], lw=0.9, label=name)
+    shade_segments(ax, segments)
+    ax.set_xlim(0, max(len(y) for y in traces.values()) * dt)
+    ax.set_ylim(0, None)
+    ax.set_xlabel("time along the round trip (s)")
+    ax.set_ylabel("trunk from reference (cm)")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=8, ncol=3)
+    ax.set_title("Same policy, nominal robot: MJX/Warp (training engine) vs CPU MuJoCo at two timesteps", fontsize=10)
     return fig

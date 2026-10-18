@@ -24,6 +24,12 @@ python scripts/visualize.py transitions   # report + recommended morphology
 python scripts/dynamics_run.py            # Crocoddyl on the recommended morphology's plans (~5 min)
 python scripts/visualize.py dynamics      # torque/speed/friction report, actuator spec, 3D replays
 
+# M0 step 3 (RL round trips; GPU):
+python scripts/rl_reference.py            # plan both whole flights, build the round-trip reference (~3 min)
+python scripts/rl_train.py                # PPO tracking policy on MJX/Warp, 4096 envs (~1 h for 400M steps)
+python scripts/rl_eval.py                 # whole round trips: randomized, nominal, friction sweep, CPU MuJoCo cross-check
+python scripts/visualize.py rl            # report, written into the same outputs/<date>_rl folder
+
 python scripts/ladder_sweep.py            # the sweep as text tables (--csv out.csv)
 python scripts/build_models.py            # write MJCF scenes to sim/models/
 ```
@@ -39,6 +45,8 @@ python scripts/build_models.py            # write MJCF scenes to sim/models/
 | `terrain.py` | 2D terrain for planners: shapes, walking surfaces, envelope, mirroring, cached occupancy grid |
 | `transitions.py` | Quasi-static free-gait crawl planner through the stair transitions, with verified swing paths |
 | `dynamics.py` | Crocoddyl whole-body trajectory optimisation along a plan (friction cones, torque bounds) |
+| `reference.py` | Round-trip kinematic reference: whole-flight plans, the 3D landing crawl, reversal for rear-first descent |
+| `rl.py` | MJX (Warp) tracking environment: residual PD policy, torque-speed envelope, rewards, domain randomization |
 | `viz.py`, `render.py` | Matplotlib figures and offscreen MuJoCo renders |
 
 MJCF is the single source of truth. Pinocchio and Crocoddyl load it directly
@@ -46,4 +54,4 @@ MJCF is the single source of truth. Pinocchio and Crocoddyl load it directly
 
 Actuator values marked `ESTIMATE` in `params.py` are placeholders until M1
 sysID. The torque-speed envelope (`JointActuation.torque_limit`) can't be
-expressed in MJCF, so the RL environment must apply it to commands.
+expressed in MJCF, so the RL environment (`rl.py`) applies it to every PD torque.

@@ -9,7 +9,13 @@ dependencies:
   - matplotlib
   - pyyaml
   - pytest
+  - pyflakes
   - pip
   - pip:
-      - mujoco
+      - mujoco==3.16.0
+      # M0 step 3 (RL on the GPU). Brax 0.14 still calls APIs that JAX 0.9+ removed.
+      - jax[cuda12]==0.8.2
+      - mujoco-mjx[warp]==3.16.0
+      - brax==0.14.2
+      - playground==0.2.0
       - -e ./sim

@@ -6,6 +6,7 @@ Usage:
   python scripts/visualize.py bins      # bin rim height study
   python scripts/visualize.py transitions   # stair transition plans (run transition_sweep.py first)
   python scripts/visualize.py dynamics      # Crocoddyl results (run dynamics_run.py first)
+  python scripts/visualize.py rl            # RL round trips (run rl_reference/rl_train/rl_eval first)
   python scripts/visualize.py all
   python scripts/visualize.py view [--ladder SEG_CM GAP_CM]   # interactive viewer (needs a display)
 
@@ -721,6 +722,333 @@ torques, which the quasi-static plans bound.
     return d
 
 
+def _wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    p, den = k / n, 1 + z * z / n
+    c, h = (p + z * z / (2 * n)) / den, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def cmd_rl(tag: str = "main") -> Path:
+    """M0 step 3 report: the round-trip reference, training, and the round-trip evaluation.
+    Written into the same outputs/<date>_rl folder as the data it reads."""
+    import json
+
+    import mujoco
+
+    from cleandog_sim import viz
+    from cleandog_sim.render import View, render_trajectory_gif, render_views
+    from cleandog_sim.robot import joint_actuation
+    from cleandog_sim.transitions import morphology
+
+    viz.style()
+    d = latest("*_rl/reference.json").parent
+    ref_info = json.loads((d / "reference.json").read_text())
+    plans = json.loads((d / "plans.json").read_text())
+    train = json.loads((d / f"train_{tag}.json").read_text())
+    ev = json.loads((d / f"eval_{tag}.json").read_text())
+    z = np.load(d / f"eval_{tag}.npz")
+    key = tuple(ref_info["morphology"])
+    p, s = morphology(*key), StairParams()
+    acts = {ja.joint: ja for ja in joint_actuation(p)}
+    segs = ref_info["segments"]
+    res = ev["results"]
+    ctrl_dt = ev["ctrl_dt"]
+
+    # -- figures
+    f_ref = save(viz.fig_reference_overview(ref_info["dt"], ref_info["margins_every"], np.array(ref_info["margins"]),
+                                            segs), d, "reference_margin.png")
+    f_crawl = save(viz.fig_landing_crawl(p, s, ref_info["crawl"]), d, "landing_crawl.png")
+    f_train = save(viz.fig_training_curve(train["curve"], 1000), d, f"training_{tag}.png")
+    mus = sorted(float(k.split()[1]) for k in res if k.startswith("friction"))
+    f_succ = save(viz.fig_success(res, mus), d, f"success_{tag}.png")
+    f_track = save(viz.fig_tracking_along_trip(ctrl_dt * 5, z["rand_pos_err"], segs, z["rand_failed_at"],
+                                               ev["term_pos"]), d, f"tracking_{tag}.png")
+    engines = {"MJX / Warp, dt 4 ms": z["nom_pos_err"]}
+    for k, lab in (("cpu4", "CPU MuJoCo, dt 4 ms"), ("cpu2", "CPU MuJoCo, dt 2 ms")):
+        if f"{k}_pos_err" in z:
+            engines[lab] = z[f"{k}_pos_err"]
+    f_eng = save(viz.fig_engine_agreement(ctrl_dt, engines, segs), d, f"engines_{tag}.png")
+
+    joints = ev["joints"]
+    nj = len(joints)
+    tau_peak = z["rand_tau_peak"].reshape(-1, nj).max(0)
+    tau_rms = z["rand_tau_rms"].reshape(-1, nj).max(0)  # worst trip's RMS per joint
+    qd_peak = z["rand_qd_peak"].reshape(-1, nj).max(0)
+    demand = {}
+    for role in ("abad", "hip", "knee"):
+        idx = [joints.index(f"{leg}_{role}") for leg in ("FL", "FR", "RL", "RR")]
+        demand[role] = dict(peak=float(tau_peak[idx].max()), rms=float(tau_rms[idx].max()),
+                            speed=float(qd_peak[idx].max()))
+    f_dem = save(viz.fig_actuator_demand(demand, acts, "Closed-loop actuator demand over the successful randomized "
+                                         "round trips (worst case), with the 30% margin. n× = capability / demand."),
+                 d, f"actuator_demand_{tag}.png")
+    nom_rms = np.sqrt(z["nom_tau_ms"].mean(0))
+
+    # -- 3D replays of the nominal trip (MJX trace, every 0.1 s)
+    model = mujoco.MjModel.from_xml_string(build_scene_xml(p, s.open_sides()))
+    qpos = z["nom_qpos"]
+    every = 5 * ctrl_dt
+    gifs = []
+    for name, az, el, dist in (("lower flight", 65, -20, 1.6), ("landing", 90, -75, 2.2),
+                               ("upper flight", -60, -20, 1.6), ("upper flight (down, rear-first)", -60, -20, 1.6),
+                               ("landing (down, rear-first)", 90, -75, 2.2), ("lower flight (down, rear-first)", 65, -20, 1.6)):
+        sg = next(x for x in segs if x["name"] == name)
+        i0, i1 = int(sg["start"] / every), int((sg["start"] + sg["duration"]) / every)
+        fn = f"replay_{tag}_{name.split(' (')[0].replace(' ', '_')}{'_down' if 'down' in name else '_up'}.gif"
+        render_trajectory_gif(model, qpos[i0:i1], d / fn, dt=every, every=0.6, fps=15, azimuth=az, elevation=el,
+                              distance=dist)
+        gifs.append((name, fn))
+    q_still = qpos[int((segs[1]["start"] + 60) / every)]
+    stills = render_views(model, q_still, [View("side", tuple(q_still[:3]), 1.4, 65, -18)], d, f"still_{tag}")
+
+    # -- tables
+    def row(name):
+        r = res[name]
+        ci = r.get("ci95")
+        ci_s = f"{ci[0]:.1%}–{ci[1]:.1%}" if ci and r["trips"] > 1 else "–"
+        where = ""
+        if r["failed_at"]:
+            names = []
+            for f in r["failed_at"]:
+                tt = f * ctrl_dt
+                names.append(next((viz._short(sg["name"]) for sg in segs
+                                   if sg["start"] <= tt < sg["start"] + sg["duration"]), "?"))
+            where = ", ".join(f"{n} ×{names.count(n)}" for n in dict.fromkeys(names))
+        return (f"| {name} | {r['success']}/{r['trips']} | **{r['rate']:.1%}** | {ci_s} | "
+                f"{r['end_err_median'] * 100:.1f} cm | {where or '–'} |")
+
+    order = ["randomized", "nominal"] + [f"friction {m:.1f}" for m in mus] + [k for k in res if k.startswith("cpu")]
+    table = "\n".join(row(n) for n in order if n in res)
+    rand = res["randomized"]
+    seg_rows = "\n".join(f"| {sg['name']} | {sg['start']:.0f} s | {sg['duration']:.0f} s | "
+                         f"{sg['min_margin'] * 100:.1f} cm |" for sg in segs)
+    spec_rows = "\n".join(
+        f"| {viz.ROLE_TITLES[r]} | {demand[r]['peak']:.1f} → **{demand[r]['peak'] * 1.3:.1f}** | "
+        f"{acts['FL_' + r].peak_torque:.1f} | {demand[r]['rms']:.1f} → **{demand[r]['rms'] * 1.3:.1f}** | "
+        f"{acts['FL_' + r].rated_torque:.1f} | {demand[r]['speed']:.1f} | {acts['FL_' + r].max_speed:.0f} |"
+        for r in demand)
+    nom_rms_rows = ", ".join(f"{j} {v:.1f}" for j, v in zip(joints, nom_rms) if j.endswith("knee"))
+    sway = ref_info["sway_frames"]
+    sway_txt = "; ".join(f"{fl}: " + ", ".join(f"{float(k):.0%} sway for {v} frames" for k, v in sorted(
+        sway[fl].items(), key=lambda kv: -float(kv[0]))) for fl in sway)
+    sweep_k = sum(res[f"friction {m:.1f}"]["success"] for m in mus)
+    sweep_n = sum(res[f"friction {m:.1f}"]["trips"] for m in mus)
+    sweep_lo, sweep_hi = _wilson(sweep_k, sweep_n)
+    nom_rows = []
+    for role in ("abad", "hip", "knee"):
+        idx = [joints.index(f"{leg}_{role}") for leg in ("FL", "FR", "RL", "RR")]
+        pk = float(z["nom_tau_peak"][:, idx].max())
+        nom_rows.append(f"| {viz.ROLE_TITLES[role]} | {pk:.1f} → **{pk * 1.3:.1f}** | "
+                        f"{acts['FL_' + role].peak_torque:.1f} | {nom_rms[idx].max():.1f} | "
+                        f"{np.abs(z['nom_qd'][:, idx]).max():.1f} |")
+    fails = np.sort(z["rand_failed_at"][z["rand_failed_at"] >= 0] * ctrl_dt)
+    T = ev["n_steps"] * ctrl_dt
+    mirrored = sum(1 for f in fails if f < T / 2 and np.any(np.abs((T - fails) - f) < 3.0))
+    gif_md = "\n\n".join(f"**{viz._short(n)}** ({n})\n\n![]({fn})" for n, fn in gifs)
+    verdict = "**Met.**" if rand["rate"] >= 0.95 else "**Not met yet.**"
+
+    md = f"""# Round trips with an RL tracking policy (M0 step 3)
+
+Generated {dt.datetime.now():%Y-%m-%d %H:%M} by `scripts/visualize.py rl`, from the data in
+this folder. Morphology: **{key[0] * 100:.0f} cm segments, knees {key[1]}, hip spacing
+{key[2] * 100:.1f} cm**, {p.total_mass_target} kg. Policy `{tag}` after
+{ev['policy_step'] / 1e6:.0f}M environment steps.
+
+**M0 exit item 3 (≥ 95% simulated round trips on your stairwell): {verdict}**
+{rand['success']} of {rand['trips']} randomized round trips completed
+({rand['rate']:.1%}, 95% CI {rand['ci95'][0]:.1%}–{rand['ci95'][1]:.1%}).
+
+![]({stills[0]})
+
+## 1. The round trip the policy follows
+
+A round trip is one continuous motion of {ref_info['duration']:.0f} s
+({ref_info['duration'] / 60:.1f} min). It starts on the floor, climbs the lower
+flight, crosses the landing (turning 180°), and climbs the upper flight to the
+upper floor. Then it plays the same motion backwards. The plans are
+quasi-static, so the reverse of a valid plan is valid: **the descent is
+rear-first, retracing the ascent.**
+
+| Segment | Starts | Lasts | Tightest static margin |
+| --- | --- | --- | --- |
+{seg_rows}
+
+- **Flights.** The step-1 planner was rerun over each *whole* flight, not just
+  the transitions. The lower flight took {plans['info']['lower']['moves']}
+  moves and the upper {plans['info']['upper']['moves']}. Each move is a 1.0 s
+  trunk shift on four feet, then a 0.8 s swing along the planner's verified
+  collision-free path. That works out to
+  {segs[1]['duration'] / 8:.0f} s per riser, against the plan's ≤ 20 s target.
+- **Landing.** A quasi-static crawl on flat ground, generated in 3D. The trunk
+  walks to mid-landing, turns 90° in place, crosses to the upper flight's
+  line, turns 90° more, and steps to the upper flight's start pose. The neck
+  stays folded, keeping the turning circle at 46 cm on the 89 cm landing.
+  Before each swing the trunk shifts (sways) to the smallest offset that puts
+  the centre of mass ≥ 2.5 cm inside the other three feet.
+- **Correction found while building this:** the planner's sideways sway is a
+  2D idea and ignores the ab/ad joint limit (±0.6 rad). Where a hip sits low
+  over its foot, a 5 cm sway needs more than that, and the 3D IK dragged
+  planted feet by up to 18 mm. Each shift now keeps the largest sway (in
+  quarters) that the 3D IK reaches exactly: {sway_txt}. The 3D margin left is
+  still positive everywhere (below).
+
+![]({f_ref})
+
+![]({f_crawl})
+
+The reference is kinematic: poses and contact timing, not forces.
+
+- **Penetration:** replayed in MuJoCo, front thighs dip up to 11 mm into a
+  bullnose at the tightest pockets. The ab/ad tilt shortens the leg's
+  side-view projection, so the IK bends the knee further than the 2D planner
+  assumed.
+- **Contact:** the physics in RL resolves this contact; the policy has to
+  live with it.
+
+## 2. The policy
+
+A **residual tracking policy** (DeepMimic style):
+- **Command:** at 50 Hz it outputs joint offsets `a` in [−1, 1], and the PD
+  target is `q* = q_ref(t+1) + 0.25·a`, so the policy can move each joint up to
+  0.25 rad off the reference.
+- **Motor model:** a PD loop at the 250 Hz physics rate produces torques
+  `τ = kp(q* − q) − kd·q̇`. Each torque is clipped to the actuator's linear
+  torque-speed envelope `|τ| ≤ τ_peak (1 − |q̇|/ω_max)`, as `params.py`
+  defines it.
+- **Observations:** what the robot can estimate. That is IMU gravity and
+  gyro, joint angles and speeds, body velocity, the last action, and the
+  reference 0.02 s, 0.1 s and 0.5 s ahead (joint angles, and trunk pose
+  relative to the robot's own pose).
+  - **Assumption:** the robot localizes itself against the stairwell to
+    about 1 cm. On the real robot that is the M4 perception stack's job.
+- **Critic:** additionally sees privileged state (true foot errors, contact,
+  friction, mass, gains).
+
+**Reward** per step, clipped at 0 so that ending early never pays. Errors are
+e_q (joints), e_p (trunk position), e_R (trunk angle), e_f (feet) and e_v
+(joint speeds):
+
+  r = 0.3·exp(−mean e_q²/0.15²) + 0.2·exp(−e_p²/0.05²) + 0.15·exp(−e_R²/0.15²)
+    + 0.25·exp(−mean e_f²/0.03²) + 0.1·exp(−mean e_v²/1.5²)
+    − 5·10⁻⁵ Σ τ² − 0.005 Σ Δa² − 0.1 Σ_touchdowns |v_foot|² − 0.2·[trunk or skid touching]
+
+The torque² term stands for motor heating. The touchdown-velocity term stands
+for noise; the plan asks for both.
+
+**Domain randomization** (per environment):
+- foot friction μ 0.4–1.0 and skid friction 0.1–0.3;
+- link masses ±10%, a payload of −0.3 to +1.0 kg on the trunk, and its centre
+  of mass ±2 cm;
+- joint friction ×0.5–2 and rotor inertia ×0.9–1.2;
+- PD gains ±20% and motor strength 85–100%;
+- actuation latency 0–12 ms;
+- observation noise;
+- a 0–0.25 m/s sideways shove every 4–10 s.
+
+**Training:**
+- **Simulator:** PPO (Brax) on MuJoCo MJX with the Warp backend. It uses
+  the real stairwell: cylinder nosings, balusters and elliptic friction
+  cones, at 4096 parallel environments.
+- **Episodes:** 20 s, each starting anywhere on the round trip.
+
+![]({f_train})
+
+## 3. Round-trip evaluation
+
+Every evaluation trip starts at the bottom (reference time 0) and runs the
+whole {ref_info['duration'] / 60:.1f} minutes with no resets. A trip **fails**
+if the trunk ever strays more than {ev['term_pos'] * 100:.0f} cm or
+{ev['term_rot']:.1f} rad from the reference. That is earlier than a fall: a
+robot that far off the plan is presumed lost. A trip **succeeds** if it never
+fails and ends within 5 cm of where it started. Intervals are Wilson 95%
+score intervals.
+
+| Condition | Completed | Rate | 95% CI | Median end error | Failures (where) |
+| --- | --- | --- | --- | --- | --- |
+{table}
+
+![]({f_succ})
+
+![]({f_track})
+
+### What the failures say
+
+- **Shoves are what fails trips.** The friction sweep randomizes everything
+  except the shoves. Pooled over its five friction values it completes
+  {sweep_k}/{sweep_n} trips ({sweep_k / sweep_n:.1%}, 95% CI {sweep_lo:.1%}–{sweep_hi:.1%}),
+  against {rand['rate']:.1%} with shoves. Friction from 0.3 to 0.8 makes little
+  difference, so the planned rubber-on-hardwood contact is not the bottleneck.
+- **The failures sit at a few fixed spots, mostly on the lower flight, and
+  in both directions.** Of the ascent failures, {mirrored} have a descent failure
+  within 3 s of the same reference pose. The descent is the ascent reversed,
+  so these are physical spots in the plan where a shove can't be recovered.
+- **It isn't the static margin.** The failures happen where the reference
+  margin is 1.6–2.1 cm. The tightest spot (0.35 cm) never fails. The cause is
+  still open: a contact event (a thigh on a bullnose, a swing foot near a
+  nosing) is the next thing to check.
+
+## 4. Cross-check: MJX/Warp vs CPU MuJoCo
+
+The same policy and the same observation code run the nominal trip in the C
+MuJoCo library. It runs once at the training timestep and once at half of it.
+If the policy were exploiting a quirk of the GPU solver or of the 4 ms step,
+the trip would fail or drift here.
+
+![]({f_eng})
+
+## 5. Actuator demand in closed loop
+
+These are worst cases over the successful randomized trips. Failed trips are
+left out because a robot flails once it has failed. The randomization includes
+the shoves, the 15% weaker motors and the heavier payloads, so this is
+conservative. Simulated torque can never exceed the envelope, so the test is
+whether demand × 1.3 fits under it.
+
+| Joint | Peak needed → with margin | Actuator peak | RMS needed → with margin | Actuator rated | Peak speed (rad/s) | Actuator max speed |
+| --- | --- | --- | --- | --- | --- | --- |
+{spec_rows}
+
+![]({f_dem})
+
+The shoves set these peaks: torque saturates while the policy catches the
+robot. On the nominal trip, with no shoves, demand fits the actuators with the
+30% margin:
+
+| Joint | Peak (nominal) → with margin | Actuator peak | RMS | Peak speed (rad/s) |
+| --- | --- | --- | --- | --- |
+{chr(10).join(nom_rows)}
+
+On the nominal trip, the knee RMS torques are {nom_rms_rows} Nm. The
+Crocoddyl step reported 2.9 Nm on the transitions alone. The RL numbers
+include holding still and the policy's own stiffness choices.
+
+## 6. Replays (nominal trip, MJX trace)
+
+Walls and balusters are hidden for visibility; the landing is seen from
+above.
+
+{gif_md}
+
+## What is not modelled
+
+- **Stair geometry:** the stair geometry is your stairwell's, exactly. The
+  randomized stairs in the plan's workflow (rise 17–20 cm, tread 21–28 cm)
+  would need a reference planned per variant. That is cheap (about 1 min per
+  flight) but not done here.
+- **Localization:** the policy is told its pose relative to the stairwell
+  (1 cm noise); real localization error and drift are not modelled.
+- **Actuators:** no motor thermal model (RMS is reported instead), no
+  backlash, no cable drag.
+- **Estimates:** actuator values tagged ESTIMATE (speed, friction, rotor
+  inertia) await M1 sysID.
+- **Contact:** contact is MuJoCo's soft contact. The plan flags rubber on a
+  bullnose and the belly sliding on a nosing as the least trustworthy parts,
+  for M1 to measure.
+"""
+    (d / "report.md").write_text(md)
+    return d
+
+
 # ---------------------------------------------------------------- interactive
 
 def cmd_view(args) -> None:
@@ -745,7 +1073,7 @@ def cmd_view(args) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "all"):
+    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "rl", "all"):
         sub.add_parser(name)
     v = sub.add_parser("view")
     v.add_argument("--ladder", nargs=2, type=float, metavar=("SEG_CM", "GAP_CM"),
@@ -757,7 +1085,7 @@ def main(argv=None) -> int:
         cmd_view(args)
         return 0
     cmds = {"stairs": cmd_stairs, "ladder": cmd_ladder, "bins": cmd_bins, "transitions": cmd_transitions,
-            "dynamics": cmd_dynamics}
+            "dynamics": cmd_dynamics, "rl": cmd_rl}
     for name in (cmds if args.cmd == "all" else [args.cmd]):
         print(f"{name}: {cmds[name]()}/report.md")
     return 0

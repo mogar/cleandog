@@ -207,7 +207,20 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
   - An actuator torque/speed spec with ≥ 30% margin.
   - ≥ 95% simulated round trips on your stairwell.
   - A go/no-go on the Pupper v3 testbed (below).
-- **Status (2026-10-16): exit items 1, 2 and 4 met; item 3 (RL round trips) is next.** Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
+- **Status (2026-10-18): exit items 1, 2 and 4 met; item 3 not met yet (74.5% of round trips with shoves, 94.7% without).** Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
+  - **RL round trips (step 3):**
+    - **Reference:** one 820 s (13.7 min) round trip, used as the reference.
+      - **Flights:** planned whole, about 17 s per riser, inside the 20 s target.
+      - **Landing:** a 3D quasi-static crawl that turns 180° with the neck folded.
+      - **Descent:** the ascent reversed, so rear-first.
+    - **Policy:** a residual PPO tracking policy, trained on MJX/Warp in the real stairwell with domain randomization.
+    - **Results:**
+      - nominal robot: 4/4 trips, with CPU MuJoCo at 4 ms and 2 ms agreeing;
+      - all randomization except shoves: 303/320 (94.7%, CI 91.7–96.7%), flat across foot friction 0.3–0.8;
+      - with 0–0.25 m/s shoves every 4–10 s: 149/200 (74.5%).
+    - **Failure spots:** failures recur at a few fixed spots, mostly on the lower flight and in both directions. They are not where the static margin is lowest. Diagnosing them is next.
+  - **Correction:** the step-1 planner's 5 cm sway ignores the ±0.6 rad ab/ad limit. The reference cuts sway where 3D IK can't reach it, and the 3D static margin stays positive everywhere (min 0.35 cm). The planner should check ab/ad limits itself.
+  - **Closed-loop torque:** on the nominal trip the closed-loop peaks (knee 12.1, hip 8.7, ab/ad 4.5 Nm) fit the actuators with the 30% margin and agree with Crocoddyl. Recovering from shoves saturates the knee and hip at 17 Nm.
   - **Morphology:** 16 cm thigh and shin, knees backward, hip spacing 25 cm, trunk about 38 × 22 cm, 8.5 kg budget.
     - A quasi-static free-gait planner with verified swing paths completes all four uphill-facing transitions: floor→flight, flight→landing, landing→flight, flight→upper floor.
     - 13 cm segments are proven infeasible at 29.2 cm hip spacing; 14 cm was not resolved even with a 10× search budget.

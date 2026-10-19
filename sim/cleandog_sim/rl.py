@@ -52,6 +52,7 @@ from .scene import build_scene_xml
 
 CTRL_DT = 0.02
 SIM_DT = 0.004
+N_FORCED = 4  # scheduled shoves an episode can hold: one per flight in a round trip
 
 
 def default_config() -> config_dict.ConfigDict:
@@ -76,7 +77,12 @@ def default_config() -> config_dict.ConfigDict:
         randomize_gains=True,
         latency_substeps=(0, 3),  # actuation delay, in physics steps (0-12 ms)
         init_noise=config_dict.create(joint=0.03, xy=0.01, yaw=0.03),
+        # Start more episodes where the trunk is steep: shoves tip the robot there (M0 step 3d).
+        steep_start_deg=40.0,
+        steep_start_weight=3.0,
         impl="warp",
+        # Who records CUDA graphs for the Warp physics: "warp" (MJX's GPU default), "jax" or "none".
+        graph_mode="warp",
         naconmax_per_env=32,
         njmax=160,
     )
@@ -169,12 +175,18 @@ class StairTrack(mjx_env.MjxEnv):
         super().__init__(config)
         self.p, self.s = p, s
         self._mj_model = mujoco.MjModel.from_xml_string(rl_scene_xml(p, s, config.sim_dt))
-        self._mjx_model = mjx.put_model(self._mj_model, impl=config.impl)
+        kw = {}
+        if config.impl == "warp":
+            import warp as wp
+
+            kw["graph_mode"] = getattr(wp.JaxCallableGraphMode, config.graph_mode.upper())
+        self._mjx_model = mjx.put_model(self._mj_model, impl=config.impl, **kw)
         self.batch = batch
         self.naconmax = config.naconmax_per_env * batch
         self.episode_length = episode_length
         m = self._mj_model
         self.ref = ref_arrays(m, ref)
+        self.segment_names = list(ref.segment_names)
         self.N = len(ref.qpos)
         self._rq = jp.array(self.ref.qpos, jp.float32)
         self._rv = jp.array(self.ref.qvel, jp.float32)
@@ -199,6 +211,11 @@ class StairTrack(mjx_env.MjxEnv):
         self._skid_geoms = np.array([m.geom(n).id for n in ("skid", "skid_lip_front", "skid_lip_rear")])
         self._trunk_body = m.body("trunk").id
         self.start_index: int | None = None  # set to start every episode at one reference frame
+        # Episode start frames, weighted toward steep trunk pitch.
+        w, x, y, z = self.ref.qpos[:, 3:7].T
+        self.ref_pitch = np.degrees(np.abs(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))))
+        weights = np.where(self.ref_pitch >= config.steep_start_deg, config.steep_start_weight, 1.0)
+        self._start_logits = jp.array(np.log(weights / weights.sum()), jp.float32)
 
     # -- required properties
     @property
@@ -220,7 +237,7 @@ class StairTrack(mjx_env.MjxEnv):
     # -- reset
     def reset(self, rng: jax.Array) -> mjx_env.State:
         rng, k = jax.random.split(rng)
-        t0 = jax.random.randint(k, (), 0, self.N) if self.start_index is None else self.start_index
+        t0 = jax.random.categorical(k, self._start_logits) if self.start_index is None else self.start_index
         return self.reset_at(rng, t0)
 
     def reset_at(self, rng: jax.Array, t0) -> mjx_env.State:
@@ -253,9 +270,9 @@ class StairTrack(mjx_env.MjxEnv):
             last_touch=jp.ones(4, bool),
             # Per joint over the last control step, for the actuator check.
             tau_peak=jp.zeros(self.action_size), tau_ms=jp.zeros(self.action_size), qd=qpos[7:] * 0,
-            # A scheduled shove for diagnostics: at step `forced_push_step` (-1: never), add
-            # `forced_push` (m/s, world x-y) to the trunk velocity.
-            forced_push_step=jp.array(-1, jp.int32), forced_push=jp.zeros(2),
+            # Scheduled shoves (evaluation and diagnostics): at step forced_push_step[k] (-1: never),
+            # add forced_push[k] (m/s, world x-y) to the trunk velocity.
+            forced_push_step=jp.full(N_FORCED, -1, jp.int32), forced_push=jp.zeros((N_FORCED, 2)),
         )
         obs = self._obs(data, info, t0)
         metrics = {k: jp.zeros(()) for k in ("pos_err", "rot_err", "feet_err", "joint_err", "torque_sq",
@@ -288,7 +305,7 @@ class StairTrack(mjx_env.MjxEnv):
         spd = jax.random.uniform(kp2, (), minval=cfg.push.speed[0], maxval=cfg.push.speed[1])
         dv = jp.where(push, spd, 0.0) * jp.array([jp.cos(ang), jp.sin(ang)])
         forced = info["steps"].astype(jp.int32) == info["forced_push_step"]
-        dv = dv + jp.where(forced, 1.0, 0.0) * info["forced_push"]
+        dv = dv + jp.sum(jp.where(forced[:, None], info["forced_push"], 0.0), 0)
         data = data.replace(qvel=data.qvel.at[0:2].add(dv))
         info["push_timer"] = jp.where(push, jax.random.uniform(kp3, (), minval=cfg.push.interval[0],
                                                                maxval=cfg.push.interval[1]), info["push_timer"])

@@ -817,7 +817,8 @@ def cmd_rl(tag: str = "main") -> Path:
         return (f"| {name} | {r['success']}/{r['trips']} | **{r['rate']:.1%}** | {ci_s} | "
                 f"{r['end_err_median'] * 100:.1f} cm | {where or '–'} |")
 
-    order = ["randomized", "nominal"] + [f"friction {m:.1f}" for m in mus] + [k for k in res if k.startswith("cpu")]
+    GATE = "gate: 1 shove per flight"
+    order = [GATE, "randomized", "nominal"] + [f"friction {m:.1f}" for m in mus] + [k for k in res if k.startswith("cpu")]
     table = "\n".join(row(n) for n in order if n in res)
     rand = res["randomized"]
     seg_rows = "\n".join(f"| {sg['name']} | {sg['start']:.0f} s | {sg['duration']:.0f} s | "
@@ -845,7 +846,14 @@ def cmd_rl(tag: str = "main") -> Path:
     T = ev["n_steps"] * ctrl_dt
     mirrored = sum(1 for f in fails if f < T / 2 and np.any(np.abs((T - fails) - f) < 3.0))
     gif_md = "\n\n".join(f"**{viz._short(n)}** ({n})\n\n![]({fn})" for n, fn in gifs)
-    verdict = "**Met.**" if rand["rate"] >= 0.95 else "**Not met yet.**"
+    gate = res.get(GATE)
+    head = gate or rand
+    if head["trips"] < 100:
+        verdict = f"**Too few trips to judge ({head['trips']}).**"
+    else:
+        verdict = "**Met.**" if head["rate"] >= 0.95 else "**Not met yet.**"
+    head_txt = ("with one shove per flight (the gate set on 2026-10-18), everything else randomized" if gate
+                else "randomized, with a shove every 4–10 s")
 
     md = f"""# Round trips with an RL tracking policy (M0 step 3)
 
@@ -855,8 +863,9 @@ this folder. Morphology: **{key[0] * 100:.0f} cm segments, knees {key[1]}, hip s
 {ev['policy_step'] / 1e6:.0f}M environment steps.
 
 **M0 exit item 3 (≥ 95% simulated round trips on your stairwell): {verdict}**
-{rand['success']} of {rand['trips']} randomized round trips completed
-({rand['rate']:.1%}, 95% CI {rand['ci95'][0]:.1%}–{rand['ci95'][1]:.1%}).
+{head['success']} of {head['trips']} round trips completed {head_txt}
+({head['rate']:.1%}, 95% CI {head['ci95'][0]:.1%}–{head['ci95'][1]:.1%}). With a shove every 4–10 s
+(the training distribution): {rand['rate']:.1%}.
 
 ![]({stills[0]})
 
@@ -962,6 +971,17 @@ if the trunk ever strays more than {ev['term_pos'] * 100:.0f} cm or
 robot that far off the plan is presumed lost. A trip **succeeds** if it never
 fails and ends within 5 cm of where it started. Intervals are Wilson 95%
 score intervals.
+
+Conditions:
+- **gate: 1 shove per flight** is the M0 gate. It has one 0–0.25 m/s shove
+  at a random moment in each of the four flights, in a random direction,
+  with everything else randomized as in training.
+- **randomized** is the training distribution, with a shove every 4–10 s
+  (about 117 per trip).
+- **nominal** has no randomization, noise or shoves.
+- **friction** fixes the foot friction at the stated value, with everything
+  else randomized and no shoves.
+- **cpu mujoco** is the nominal trip in the C library, as a cross-check.
 
 | Condition | Completed | Rate | 95% CI | Median end error | Failures (where) |
 | --- | --- | --- | --- | --- | --- |

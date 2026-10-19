@@ -205,7 +205,10 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
 - **Exit:**
   - A chosen morphology: segment lengths, hip spacing, mass budget.
   - An actuator torque/speed spec with ≥ 30% margin.
-  - ≥ 95% simulated round trips on your stairwell.
+  - ≥ 95% simulated round trips on your stairwell. Measured (decided 2026-10-18):
+    - **Disturbance:** one 0–0.25 m/s shove per flight, at a random moment and in a random direction, with everything else domain-randomized.
+    - **Sample:** at least 100 trips.
+    - **Training:** still uses a shove every 4–10 s.
   - A go/no-go on the Pupper v3 testbed (below).
 - **Status (2026-10-18): exit items 1, 2 and 4 met; item 3 not met yet (74.5% of round trips with shoves, 94.7% without).** Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
   - **RL round trips (step 3):**
@@ -229,7 +232,7 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
       - **Below the slope:** no size, up to 20 cm legs, plans below the slope. Mid-flight the trunk has to lie along the stairs.
       - **Effect:** the cap removes the moments where 6.85% of shoves failed, against 1.45% just below the slope.
     - **Next:**
-      - adopted (2026-10-18): the round-trip reference now plans with the 42.4° cap (`reference.flight_planner`); retrain on it;
+      - adopted (2026-10-18): the round-trip reference now plans with the 42.4° cap (`reference.flight_planner`). Max pitch is 40.9° and the min static margin 1.27 cm (was 0.35). Retrain on it, with half of the episodes starting at moments ≥ 40°;
       - give the policy a height scan of the stairs;
       - train harder at the steep moments;
       - set the disturbance rate the 95% target is measured against.

@@ -4,7 +4,8 @@ Usage:
   python scripts/rl_eval.py [--tag main] [--trips 200]
 
 Every trip starts at the bottom of the stairs (reference frame 0) and runs the
-whole round trip without resets. A trip succeeds if the trunk never strays more
+whole round trip without resets. The M0 gate is the "gate" condition: one
+shove per flight (4 per trip), everything else randomized. A trip succeeds if the trunk never strays more
 than term_pos (20 cm) or term_rot (0.6 rad) from the reference, and ends within
 5 cm of the start. Conditions:
 
@@ -67,9 +68,15 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, c - h), min(1.0, c + h))
 
 
-def mjx_trips(env, policy, n_trips: int, seed: int, randomize: bool, foot_friction=None, keep_qpos: int = 0):
-    """Batched round trips in MJX. Returns per-trip arrays plus traces."""
+def mjx_trips(env, policy, n_trips: int, seed: int, randomize: bool, foot_friction=None, keep_qpos: int = 0,
+              shove_per_flight: bool = False):
+    """Batched round trips in MJX. Returns per-trip arrays plus traces.
+
+    `shove_per_flight`: one shove in each flight segment (4 per round trip), at a uniformly random
+    moment, in a random direction, at U(0, 0.25) m/s. This is the M0 gate's disturbance.
+    """
     import jax
+    import jax.numpy as jp
     from mujoco_playground._src import wrapper
 
     from cleandog_sim.rl import domain_randomize
@@ -105,6 +112,19 @@ def mjx_trips(env, policy, n_trips: int, seed: int, randomize: bool, foot_fricti
         return state, key, out
 
     state = jax.jit(reset)(keys)
+    if shove_per_flight:
+        rng = np.random.default_rng(seed)
+        flights = [i for i, n in enumerate(env.segment_names) if "flight" in n]
+        steps = np.zeros((n_trips, len(flights)), int)
+        for j, sid in enumerate(flights):
+            frames = np.flatnonzero(env.ref.segment == sid)
+            steps[:, j] = rng.integers(frames[0], frames[-1] + 1, n_trips)
+        ang = rng.uniform(0, 2 * np.pi, steps.shape)
+        spd = rng.uniform(0.0, 0.25, steps.shape)
+        info = dict(state.info)
+        info["forced_push_step"] = jp.array(steps, jp.int32)
+        info["forced_push"] = jp.array(np.stack([spd * np.cos(ang), spd * np.sin(ang)], -1), jp.float32)
+        state = state.replace(info=info)
     key = jax.random.PRNGKey(seed + 1)
     traces = []
     t0 = time.time()
@@ -245,6 +265,15 @@ def main(argv=None) -> int:
         results[name] = dict(trips=n, success=k, rate=k / n, ci95=[lo, hi], failed_at=fails.tolist(),
                              end_err_median=float(np.median(r["end_err"])), seconds=round(r["seconds"], 1))
         print(f"  {name}: {k}/{n} = {k / n:.1%} (95% CI {lo:.1%}-{hi:.1%}), {r['seconds']:.0f} s", flush=True)
+
+    # The M0 gate: one shove per flight, everything else randomized.
+    cfg_g = default_config()
+    cfg_g.push.enable = False
+    env_g, _ = make_env(args.trips, cfg_g, episode_length=10**9)
+    r = mjx_trips(env_g, policy, args.trips, seed=3, randomize=True, shove_per_flight=True)
+    record("gate: 1 shove per flight", r, args.trips)
+    arrays.update(gate_failed_at=r["failed_at"])
+    del r, env_g
 
     r = mjx_trips(env, policy, args.trips, seed=1, randomize=True)
     record("randomized", r, args.trips)

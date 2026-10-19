@@ -56,8 +56,15 @@ iterated without recomputing.
 - The stairwell model is the real one: 8 risers, a 78" × 35" landing with a
   180° turn, then 7 risers, with balusters on the open side of the lower
   flight. The return direction (`turn_left`) is still an assumption.
-- Only one GPU job at a time: training preallocates most of the 3090, and a
-  second job (an eval, a render) caused an out-of-memory crash.
+- Only one GPU job at a time.
+- RL training crashed with "Failed to allocate" after about 20–30 evaluations,
+  even with GPU memory free.
+  - **Cause:** Brax's full env reset at each evaluation (`num_resets_per_eval`)
+    allocates new buffers. MJX's default Warp graph mode then records new CUDA
+    graphs, until an allocation fails.
+  - **Fix:** `rl_train.py` defaults to `--resets-per-eval 0`.
+  - **Graph modes:** `graph_mode="jax"` is unsupported (CUDA rejects the nested
+    graphs), and `"none"` works but is about 5× slower.
 - Environment: conda env `cleandog` (`environment.yml`). There is no display
   in agent sessions: render offscreen with `MUJOCO_GL=egl`. The interactive
   viewer (`visualize.py view`) is for Morgan's desktop.

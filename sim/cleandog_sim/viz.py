@@ -715,7 +715,7 @@ CTRL_DT_REPORT = 0.02
 
 def fig_success(results: dict, sweep_mus: list[float]):
     fig, axes = plt.subplots(1, 2, figsize=(11, 3.4), gridspec_kw=dict(width_ratios=[1, 1.3]))
-    names = [n for n in ("nominal", "randomized") if n in results]
+    names = [n for n in ("nominal", "gate: 1 shove per flight", "randomized") if n in results]
     for i, n in enumerate(names):
         r = results[n]
         lo, hi = r.get("ci95", [r["rate"], r["rate"]])

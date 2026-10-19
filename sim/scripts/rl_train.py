@@ -14,9 +14,15 @@ import argparse
 import functools
 import json
 import pickle
+import os
 import sys
 import time
 from pathlib import Path
+
+# MuJoCo's Warp backend allocates its own GPU memory outside JAX's pool, so don't let JAX
+# reserve 75% of the card up front. (The mid-run crashes were a different problem: see
+# --resets-per-eval.)
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from visualize import latest  # noqa: E402
@@ -45,6 +51,11 @@ def main(argv=None) -> int:
     ap.add_argument("--envs", type=int, default=4096)
     ap.add_argument("--tag", default="main")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--graph-mode", default="warp", choices=("warp", "jax", "none"),
+                    help="who records CUDA graphs for the Warp physics ('jax' is unsupported, 'none' is ~5x slower)")
+    ap.add_argument("--resets-per-eval", type=int, default=0,
+                    help="full resets of all training envs at each eval. Each one allocates new buffers, and "
+                         "Warp's captured graphs then exhaust GPU memory after ~20-30 of them")
     args = ap.parse_args(argv)
 
     import jax
@@ -54,19 +65,27 @@ def main(argv=None) -> int:
 
     from cleandog_sim.rl import domain_randomize
 
-    env, out = make_env(args.envs)
-    eval_env, _ = make_env(128)
+    from cleandog_sim.rl import default_config
+
+    cfg = default_config()
+    cfg.graph_mode = args.graph_mode
+    env, out = make_env(args.envs, cfg)
+    eval_env, _ = make_env(128, cfg)
     curve = []
     t_start = time.time()
 
     def progress(step, metrics):
-        row = dict(step=int(step), seconds=round(time.time() - t_start, 1),
+        import warp as wp
+
+        mem = (wp.get_mempool_used_mem_current("cuda:0") / 2**20, wp.get_mempool_used_mem_high("cuda:0") / 2**20)
+        row = dict(step=int(step), seconds=round(time.time() - t_start, 1), warp_mem_mb=round(mem[0]),
+                   warp_mem_high_mb=round(mem[1]),
                    **{k: float(v) for k, v in metrics.items() if k.startswith("eval/") and "std" not in k})
         curve.append(row)
         print(f"  {step / 1e6:6.1f}M  {row['seconds']:6.0f}s  reward {row.get('eval/episode_reward', 0):7.1f}  "
               f"length {row.get('eval/avg_episode_length', 0):6.1f}  pos_err "
-              f"{row.get('eval/episode_pos_err', 0) / max(row.get('eval/avg_episode_length', 1), 1):.3f}",
-              flush=True)
+              f"{row.get('eval/episode_pos_err', 0) / max(row.get('eval/avg_episode_length', 1), 1):.3f}  "
+              f"warp mem {mem[0]:.0f} MB (high {mem[1]:.0f})", flush=True)
         (out / f"train_{args.tag}.json").write_text(json.dumps(dict(curve=curve, args=vars(args))))
 
     def save(step, make_policy, params):
@@ -79,7 +98,7 @@ def main(argv=None) -> int:
     ppo.train(
         environment=env, eval_env=eval_env, num_timesteps=int(args.steps), num_envs=args.envs,
         episode_length=env.episode_length, wrap_env_fn=wrapper.wrap_for_brax_training,
-        randomization_fn=domain_randomize(env), num_evals=31, num_resets_per_eval=1,
+        randomization_fn=domain_randomize(env), num_evals=31, num_resets_per_eval=args.resets_per_eval,
         normalize_observations=True, reward_scaling=1.0, action_repeat=1, unroll_length=20,
         num_minibatches=32, num_updates_per_batch=4, discounting=0.97, learning_rate=3e-4,
         entropy_cost=5e-3, batch_size=256, clipping_epsilon=0.2, max_grad_norm=1.0, seed=args.seed,

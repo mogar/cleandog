@@ -49,6 +49,8 @@ def shove_map(env, policy, push_idx: np.ndarray, speeds, seed: int = 0):
     import jax
     import jax.numpy as jp
 
+    from cleandog_sim.rl import N_FORCED
+
     angles = np.arange(N_DIRS) * 2 * np.pi / N_DIRS
     trials = [(i, v, a) for i in push_idx for v in speeds for a in angles]
     reset = jax.jit(jax.vmap(env.reset_at))
@@ -81,8 +83,12 @@ def shove_map(env, policy, push_idx: np.ndarray, speeds, seed: int = 0):
         keys = jax.random.split(jax.random.PRNGKey(seed + b0), BATCH)
         st = reset(keys, jp.array(fr - LEAD))
         info = dict(st.info)
-        info["forced_push_step"] = jp.full(BATCH, LEAD, jp.int32)
-        info["forced_push"] = jp.array(np.stack([sp * np.cos(an), sp * np.sin(an)], 1), jp.float32)
+        steps = np.full((BATCH, N_FORCED), -1)
+        steps[:, 0] = LEAD
+        pushes = np.zeros((BATCH, N_FORCED, 2))
+        pushes[:, 0] = np.stack([sp * np.cos(an), sp * np.sin(an)], 1)
+        info["forced_push_step"] = jp.array(steps, jp.int32)
+        info["forced_push"] = jp.array(pushes, jp.float32)
         st = st.replace(info=info)
         pos, rot, sat = (np.asarray(x)[:, :n] for x in run(st, jax.random.PRNGKey(seed + 7 + b0)))
         bad = (pos > cfg.term_pos) | (rot > cfg.term_rot) | ~np.isfinite(pos)

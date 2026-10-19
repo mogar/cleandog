@@ -210,7 +210,20 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
     - **Sample:** at least 100 trips.
     - **Training:** still uses a shove every 4–10 s.
   - A go/no-go on the Pupper v3 testbed (below).
-- **Status (2026-10-18): exit items 1, 2 and 4 met; item 3 not met yet (74.5% of round trips with shoves, 94.7% without).** Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
+- **Status (2026-10-19): all exit items met. M0 is complete.**
+  - **Item 3:** 196/200 round trips (98%) at the gate of one shove per flight, using the pitch-capped reference and a policy trained for 305M steps with extra episodes at steep moments.
+  - **Without shoves:** 96–98% at every foot friction from 0.3 to 0.8.
+  - **With a shove every 4–10 s:** 76.5%.
+  - **Caveat found 2026-10-19:** the sim never checks legs against the body, and in the reference the thighs pass up to 21 mm into the trunk.
+    - **Placeholders:** the leg-plane offset (12 cm from the centreline), the body width (22 cm) and the ab/ad offset (5 cm) are not a real design.
+    - **Re-verify:** M1's leg design sets these. Then the pipeline (planner, reference, RL) must be re-run with self-collision on before M2 parts are bought.
+    - **Hip layout with real motors (2026-10-19):** with a box trunk and coaxial hip/knee motors outboard, the robot is 484 mm wide (ab/ad offset 116 mm).
+    - **Design-space study (2026-10-19, proposed, not yet adopted):** 13 ideas ranked; corner notches (N), an off-axis knee motor (K) and DM-J4310P everywhere (M) tested against every frame of the round trip (`cad/scripts/design_space_run.py`, report in `outputs/2026-10-19_design-space/`).
+      - **Result:** N 395 mm, K 413 mm, M 498 mm (no help: longer motor), **N+K 304 mm** wide at the same 378 mm length and 200 mm centre section.
+      - **Why notches can't go further:** the front thighs swing back beside the whole mid-trunk (hip pitch to 129°), so the front leg plane must clear the centre section's wall. The rear legs never come forward of the rear hip.
+      - **Stairs:** in the baseline the outboard knee motor dips 33 mm into a nosing when ab/ad tucks the leg in; N+K's motor stack clears the stairs by 13 mm.
+      - **If adopted:** sim `hip_width` 0.137 m, `abad_offset` 0.0715 m (leg plane 140 mm from centre). Re-plan, add the motor stack and leg-trunk collision to the sim model, retrain. 0.7% of leg-frames have footholds that need more than ±34.4° ab/ad with the new offset (2.6% for the baseline): the re-plan moves those.
+- **Earlier status (2026-10-18):** exit items 1, 2 and 4 met; item 3 not met yet (74.5% of round trips with shoves, 94.7% without). Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
   - **RL round trips (step 3):**
     - **Reference:** one 820 s (13.7 min) round trip, used as the reference.
       - **Flights:** planned whole, about 17 s per riser, inside the 20 s target.

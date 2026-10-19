@@ -39,6 +39,9 @@ python scripts/dynamics_run.py && python scripts/visualize.py dynamics          
 python scripts/rl_reference.py && python scripts/rl_train.py                    # M0 step 3 (GPU, ~1 h)
 python scripts/rl_eval.py && python scripts/visualize.py rl                     # round trips (~25 min)
 python scripts/rl_diagnose.py && python scripts/visualize.py rl_failures        # shove map + forensics (~10 min)
+cd .. && python cad/scripts/hip_layout_report.py                                # hip stack vs trunk (OCC kernel)
+python cad/scripts/design_space_run.py && python cad/scripts/design_space_report.py   # trunk/hip design space (~20 min, 8 cores)
+python cad/scripts/view_design.py NK                                            # a design in OCP CAD Viewer (desktop)
 ```
 
 Compute-heavy steps write their data (JSON/NPZ) into `outputs/`, and the

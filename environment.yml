@@ -19,3 +19,7 @@ dependencies:
       - brax==0.14.2
       - playground==0.2.0
       - -e ./sim
+      # Mechanical CAD (cad/): build123d, plus the VS Code viewer bridge for OCP CAD Viewer.
+      - build123d==0.13.0
+      - ocp_vscode==4.2.0
+      - -e ./cad

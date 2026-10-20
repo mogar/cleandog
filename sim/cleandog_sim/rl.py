@@ -92,8 +92,9 @@ def default_config() -> config_dict.ConfigDict:
 
 def rl_scene_xml(p: RobotParams, s: StairParams, timestep: float = SIM_DT) -> str:
     """The stairwell scene plus the sensors the env reads: a touch zone at each foot, foot
-    velocities, and a touch zone around the trunk and skid plate (any contact there is
-    unplanned: the reference never rests on the belly)."""
+    velocities, a touch zone around the trunk and skid plate (any contact there is unplanned:
+    the reference never rests on the belly; legs touching the trunk count too) and one around
+    each hip stack (motors and belt meeting the stairs or the trunk)."""
     root = ET.fromstring(build_scene_xml(p, s, timestep=timestep))
     bodies = {b.get("name"): b for b in root.iter("body")}
     sensor = root.find("sensor")
@@ -106,6 +107,14 @@ def rl_scene_xml(p: RobotParams, s: StairParams, timestep: float = SIM_DT) -> st
     ET.SubElement(bodies["trunk"], "site", name="trunk_touch", type="box", pos=f"0 0 {-p.skid_thickness / 2:g}",
                   size=f"{p.body_length / 2 + 0.006:g} {p.body_width / 2 + 0.006:g} {hz + 0.006:g}", rgba="0 0 0 0")
     ET.SubElement(sensor, "touch", name="trunk_touch", site="trunk_touch")
+    y0, y1 = p.stack_y()["motors"][0], p.stack_y()["belt"][1]
+    r = p.hip_motor_radius + 0.006
+    for leg in LEGS:
+        side = 1 if leg[1] == "L" else -1
+        ET.SubElement(bodies[f"{leg}_hip"], "site", name=f"{leg}_stack_touch", type="box",
+                      pos=f"0 {side * ((y0 + y1) / 2 - p.hip_width / 2):g} {p.knee_motor_above / 2:g}",
+                      size=f"{r:g} {(y1 - y0) / 2 + 0.006:g} {p.knee_motor_above / 2 + r:g}", rgba="0 0 0 0")
+        ET.SubElement(sensor, "touch", name=f"{leg}_stack_touch", site=f"{leg}_stack_touch")
     return ET.tostring(root, encoding="unicode")
 
 
@@ -205,10 +214,11 @@ class StairTrack(mjx_env.MjxEnv):
         self._touch = [sens(f"{leg}_touch")[0] for leg in LEGS]
         self._fvel = [sens(f"{leg}_vel")[0] for leg in LEGS]
         self._trunk_touch = sens("trunk_touch")[0]
+        self._stack_touch = [sens(f"{leg}_stack_touch")[0] for leg in LEGS]
         self._gyro = sens("trunk_gyro")[0]
         self._foot_sites = np.array([m.site(f"{leg}_foot").id for leg in LEGS])
         self._foot_geoms = np.array([m.geom(f"{leg}_foot").id for leg in LEGS])
-        self._skid_geoms = np.array([m.geom(n).id for n in ("skid", "skid_lip_front", "skid_lip_rear")])
+        self._skid_geoms = np.array([i for i in range(m.ngeom) if m.geom(i).name.startswith("skid")])
         self._trunk_body = m.body("trunk").id
         self.start_index: int | None = None  # set to start every episode at one reference frame
         # Episode start frames, weighted toward steep trunk pitch.
@@ -332,7 +342,8 @@ class StairTrack(mjx_env.MjxEnv):
         touch = jp.array([data.sensordata[a] for a in self._touch]) > 1e-3
         fvel = jp.stack([data.sensordata[a:a + 3] for a in self._fvel])
         touchdown = jp.sum((touch & ~info["last_touch"]) * jp.sum(fvel**2, -1))
-        body_contact = (data.sensordata[self._trunk_touch] > 1e-3).astype(jp.float32)
+        stack = jp.array([data.sensordata[a] for a in self._stack_touch])
+        body_contact = ((data.sensordata[self._trunk_touch] > 1e-3) | jp.any(stack > 1e-3)).astype(jp.float32)
 
         w = cfg.reward
         r = dict(

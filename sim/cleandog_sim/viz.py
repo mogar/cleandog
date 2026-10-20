@@ -662,8 +662,9 @@ def fig_landing_crawl(p: RobotParams, s: StairParams, crawl: list[dict], legs=("
             ax.plot([(x_top - k * s.run) * CM] * 2, [y0 * CM, y1 * CM], color=STAIR_EDGE, lw=0.8)
         ax.text((x_top - 0.22) * CM, (y0 + y1) / 2 * CM, lab, rotation=90, ha="center", va="center", fontsize=8,
                 color=TEXT_2)
-    hl, hw = p.body_length / 2, p.body_width / 2
-    corners = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+    from .robot import trunk_outline
+
+    corners = trunk_outline(p)
     for i, c in enumerate(crawl):
         x, y, yaw = c["base"][0], c["base"][1], c["base"][3]
         R = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
@@ -927,4 +928,102 @@ def fig_pitch_cap_grid(rows: list[dict], caps: list, scenarios: list[str]):
     ax.grid(False)
     ax.set_title("Uphill transitions planned (of 4) with the trunk pitch capped; knees back. "
                  "(n?) = searches that ran out of budget", fontsize=10)
+    return fig
+
+
+# ---------------------------------------------------------------- N+K redesign (2026-10-20)
+
+CLEARANCE_PANELS = (
+    ("self", "leg ↔ trunk", "any leg or hip-stack part to the trunk, skid plate, neck or head"),
+    ("stack", "hip stack ↔ stairs", "motors and belt to the stairs, walls and floor"),
+    ("limb", "thigh/shin ↔ stairs", "thigh, hub, knee pulley and shin to the stairs (feet excluded)"),
+)
+
+
+def fig_clearance_along_trip(dt: float, clr: dict[str, np.ndarray], segments: list[dict], cap: float,
+                             limits: dict[str, float]):
+    """Per-frame 3D clearances of the reference (mm), one panel per kind; distances above `cap`
+    are not measured (drawn at the cap)."""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 7.2), sharex=True)
+    t = np.arange(len(clr["self"])) * dt
+    for ax, (k, short, long) in zip(axes, CLEARANCE_PANELS):
+        v = clr[k]
+        ax.plot(t, v, color=SERIES[0], lw=0.7)
+        ax.axhline(0, color=TEXT_2, lw=0.9)
+        if k in limits and limits[k] > 0:
+            ax.axhline(limits[k], color=SERIES[1], lw=1.0, ls=(0, (4, 3)))
+            ax.text(t[-1], limits[k], f" required {limits[k]:g} mm", va="center", fontsize=8, color=TEXT_2)
+        i = int(np.argmin(v))
+        ax.plot(t[i], v[i], "o", color=SERIES[1], ms=6, zorder=4)
+        ax.annotate(f"min {v[i]:.1f} mm", (t[i], v[i]), xytext=(8, -2), textcoords="offset points", fontsize=8.5,
+                    va="top")
+        lo = min(-5.0, v.min() * 1.15)
+        ax.set_ylim(lo, cap * 1.25)
+        ax.set_ylabel(f"{short} (mm)")
+        ax.set_title(f"{short}: {long}", fontsize=9.5, loc="left")
+        shade_segments(ax, segments, label=ax is axes[0])
+    axes[-1].set_xlim(0, t[-1])
+    axes[-1].set_xlabel(f"time along the round trip (s); clearances above {cap:.0f} mm are not resolved")
+    fig.suptitle("3D clearance of every reference frame (MuJoCo, N+K geometry). Below 0 = overlap.", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def fig_render_row(images: list[tuple[str, np.ndarray]], title: str, width: float = 15.0):
+    """A row of renders with captions."""
+    fig, axes = plt.subplots(1, len(images), figsize=(width, width / len(images) * 0.8))
+    for ax, (cap, im) in zip(np.atleast_1d(axes), images):
+        ax.imshow(im)
+        ax.set_title(cap, fontsize=9.5)
+        ax.axis("off")
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def fig_compare_success(runs: dict[str, dict], names: list[str]):
+    """Round-trip success per condition, one bar per run (old geometry vs N+K), with 95% CIs."""
+    labels = list(runs)
+    fig, ax = plt.subplots(figsize=(10, 0.55 * len(names) * len(labels) + 1.2))
+    h = 0.8 / len(labels)
+    for j, lab in enumerate(labels):
+        res = runs[lab]
+        for i, n in enumerate(names):
+            if n not in res:
+                continue
+            r = res[n]
+            y = i + (j - (len(labels) - 1) / 2) * h
+            lo, hi = r.get("ci95", [r["rate"], r["rate"]])
+            ax.barh(y, r["rate"] * 100, height=h * 0.9, color=SERIES[j], label=lab if i == 0 else None)
+            ax.plot([lo * 100, hi * 100], [y, y], color=TEXT, lw=1.1)
+            ax.text(101, y, f"{r['success']}/{r['trips']}  ({r['rate']:.1%})", va="center", fontsize=8.5)
+    ax.axvline(95, color=TEXT_2, lw=0.9, ls=(0, (4, 3)))
+    ax.text(95, len(names) - 0.45, "M0 target 95% ", ha="right", fontsize=8, color=TEXT_2)
+    ax.set_yticks(range(len(names)), names)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 125)
+    ax.set_xlabel("round trips completed (%), line = 95% CI")
+    ax.grid(axis="y", visible=False)
+    ax.legend(loc="lower left", fontsize=8.5)
+    ax.set_title("Whole round trips: old placeholder geometry vs N+K", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def fig_compare_training(curves: dict[str, list[dict]]):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.2))
+    for j, (lab, curve) in enumerate(curves.items()):
+        steps = np.array([r["step"] for r in curve]) / 1e6
+        rew = np.array([r.get("eval/episode_reward", np.nan) for r in curve])
+        length = np.array([r.get("eval/avg_episode_length", np.nan) for r in curve])
+        axes[0].plot(steps, rew, color=SERIES[j], lw=1.5, marker="o", ms=3, label=lab)
+        axes[1].plot(steps, length * CTRL_DT_REPORT, color=SERIES[j], lw=1.5, marker="o", ms=3, label=lab)
+    axes[0].set_ylabel("episode reward")
+    axes[0].set_title("Evaluation reward (128 randomized episodes)", fontsize=10)
+    axes[1].set_ylabel("survival (s, cap 20 s)")
+    axes[1].set_title("Time before the trunk strays from the reference", fontsize=10)
+    for ax in axes:
+        ax.set_xlabel("environment steps (millions)")
+    axes[0].legend(fontsize=8.5)
+    fig.tight_layout()
     return fig

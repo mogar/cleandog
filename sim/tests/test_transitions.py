@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from cleandog_sim import RobotParams, StairParams
 from cleandog_sim.stairs import Rect
@@ -51,3 +52,47 @@ def test_scenarios_cover_both_flights_and_directions():
 def test_turn_footprint_fits_landing_with_neck_folded():
     fp = turn_footprint(RobotParams(), neck_option=4)
     assert 2 * fp["radius"] < StairParams().flights[0].top_depth
+
+
+def test_sway_ik_matches_mujoco():
+    """The planner's 3D sway check (Planner.sway_ik) against MuJoCo's forward kinematics: with the
+    trunk swayed sideways, the joint angles it finds put the foot on the foothold and the knee
+    where its side view says."""
+    import mujoco
+
+    from cleandog_sim import RobotParams, load_model
+    from cleandog_sim.robot import LEGS
+    from cleandog_sim.transitions import Poses
+
+    p = RobotParams()
+    t = Terrain([Rect(-3, 3, -0.05, 0)], [Surface(-3, 3, 0, 0)], None)
+    pl = Planner(p, Scenario("lower", "bottom", "up", t, 8, -1.0, (0,), (0,)))
+    m = load_model(p)
+    d = mujoco.MjData(m)
+    rng = np.random.default_rng(3)
+    checked = 0
+    for _ in range(40):
+        P = Poses(np.array([[0.0, rng.uniform(0.18, 0.26)]]), np.array([rng.uniform(-0.4, 0.4)]))
+        feet = {leg: P.hip(p, leg[0] == "F")[0] + [rng.uniform(-0.08, 0.08), -rng.uniform(0.12, 0.25)] for leg in LEGS}
+        y = rng.uniform(-0.05, 0.05)
+        iks = {leg: pl.sway_ik(P, leg, feet[leg], np.array([y])) for leg in LEGS}
+        if not all(pl.sway_leg_ok(P, leg, feet[leg], np.array([y]), collide=False)[0, 0] for leg in LEGS):
+            continue
+        d.qpos[:] = 0
+        d.qpos[:3] = P.centre[0, 0], y, P.centre[0, 1]
+        d.qpos[3:7] = np.cos(P.pitch[0] / 2), 0, -np.sin(P.pitch[0] / 2), 0  # nose up
+        for i, leg in enumerate(LEGS):
+            ik = iks[leg]
+            sign = 1 if leg[1] == "L" else -1  # right legs mirror the ab/ad angle
+            d.qpos[7 + 3 * i:10 + 3 * i] = sign * ik["abad"][0, 0], ik["hip"][0, 0], ik["knee"][0, 0]
+        mujoco.mj_kinematics(m, d)
+        for leg in LEGS:
+            ik = iks[leg]
+            foot = d.site_xpos[m.site(f"{leg}_foot").id]
+            assert foot[[0, 2]] == pytest.approx(feet[leg], abs=1e-6)
+            assert foot[1] == pytest.approx(p.leg_plane_y * (1 if leg[1] == "L" else -1), abs=1e-6)
+            knee = d.xpos[m.body(f"{leg}_shin").id][[0, 2]]
+            side = ik["hip_world"][0] + ik["knee_xz"][0, 0, 0] * ik["ex"][0] + ik["knee_xz"][0, 0, 1] * ik["ez"][0]
+            assert knee == pytest.approx(side, abs=1e-6)
+        checked += 1
+    assert checked >= 10

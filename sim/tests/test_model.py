@@ -98,3 +98,47 @@ def test_links_have_thickness():
     foot = np.array([0.673, 0.808])
     assert not leg_ik(p, s, hip[None], foot[None], knee_back=False).ok[0]
     assert leg_ik(p.with_(thigh_radius=0.0, shin_radius=0.0), s, hip[None], foot[None], knee_back=False).ok[0]
+
+
+def _contacts(m, d):
+    return {frozenset((m.geom(c.geom1).name, m.geom(c.geom2).name)) for c in d.contact[:d.ncon]}
+
+
+def test_legs_and_hip_stacks_collide_with_the_trunk():
+    """Self-collision is on for leg vs trunk (the robot can't pass a leg through itself) and off
+    between a leg and its own hip stack, which overlap by construction."""
+    m = load_model(RobotParams())
+    d = mujoco.MjData(m)
+    mujoco.mj_resetDataKeyframe(m, d, 0)
+    d.qpos[2] += 0.5
+    mujoco.mj_forward(m, d)
+    assert not _contacts(m, d)  # standing: nothing touches
+    d.qpos[7:10] = (-0.6, 2.5, -2.2)  # FL folded back and tucked in: the foot meets the skid plate
+    mujoco.mj_forward(m, d)
+    assert frozenset(("FL_foot", "skid")) in _contacts(m, d)
+    d.qpos[7:10] = (-1.2, 0.0, -0.5)  # past the ab/ad range: the hip motor meets the nose
+    mujoco.mj_forward(m, d)
+    assert frozenset(("FL_hip_motor", "trunk_shell_nose")) in _contacts(m, d)
+
+
+def test_clearance_of_the_stand_pose():
+    from cleandog_sim.reference import Clearance
+
+    p = RobotParams()
+    m = load_model(p, StairParams())  # keyframe: standing on the floor before the first riser
+    d = mujoco.MjData(m)
+    mujoco.mj_resetDataKeyframe(m, d, 0)
+    c = Clearance(p, StairParams())(d.qpos)
+    # Nearest leg part to the trunk: the hip motor, 6 mm from the centre section's end wall.
+    assert c["self"] == pytest.approx(6.0, abs=0.05)
+    assert c["stack"] == pytest.approx(Clearance.MARGIN * 1000)
+
+
+def test_notched_planform():
+    p = RobotParams()
+    m = load_model(p)
+    assert m.geom("trunk_shell").size[:2] == pytest.approx((p.trunk_notch_x, p.body_width / 2))
+    assert m.geom("trunk_shell_nose").size[1] == pytest.approx(p.trunk_nose_width / 2)
+    assert p.overall_width == pytest.approx(0.304)
+    box = load_model(p.with_(trunk_notch_x=p.body_length / 2))
+    assert box.geom("trunk_shell").size[:2] == pytest.approx((p.body_length / 2, p.body_width / 2))

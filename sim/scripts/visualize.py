@@ -7,6 +7,7 @@ Usage:
   python scripts/visualize.py transitions   # stair transition plans (run transition_sweep.py first)
   python scripts/visualize.py dynamics      # Crocoddyl results (run dynamics_run.py first)
   python scripts/visualize.py rl            # RL round trips (run rl_reference/rl_train/rl_eval first)
+  python scripts/visualize.py nk            # N+K hip layout: model, re-plan, clearances, RL vs old geometry
   python scripts/visualize.py all
   python scripts/visualize.py view [--ladder SEG_CM GAP_CM]   # interactive viewer (needs a display)
 
@@ -829,6 +830,22 @@ def cmd_rl(tag: str = "main") -> Path:
         f"{acts['FL_' + r].rated_torque:.1f} | {demand[r]['speed']:.1f} | {acts['FL_' + r].max_speed:.0f} |"
         for r in demand)
     nom_rms_rows = ", ".join(f"{j} {v:.1f}" for j, v in zip(joints, nom_rms) if j.endswith("knee"))
+    from cleandog_sim.reference import NECK_FOLDED
+    from cleandog_sim.transitions import turn_footprint
+
+    turn_d = 2 * turn_footprint(p, NECK_FOLDED)["radius"] * 100
+    clr = ref_info.get("clearance")
+    if clr:
+        lm, sf, st = clr["limb"], clr["self"], clr["stack"]
+        clearance_md = f"""Replayed in MuJoCo, with the robot's full collision geometry:
+- **Legs vs trunk:** ≥ {sf['min']:.1f} mm everywhere (closest: {' / '.join(sf['pair'])}).
+- **Hip stacks vs stairs:** ≥ {st['min']:.1f} mm everywhere (closest: {' / '.join(st['pair'])}).
+- **Thighs and shins vs stairs:** {'clear everywhere' if lm['min'] >= 0 else
+            f"down to {lm['min']:.1f} mm into a nosing ({lm['pair'][0] if 'world' not in lm['pair'][0] else lm['pair'][1]}, {lm['segment']}), on {lm['frames_below_0']} of {ref_info['n_up'] * 2} frames"}.
+  The physics in RL resolves any such contact; the policy has to live with it.
+"""
+    else:
+        clearance_md = "- **Clearance:** not measured for this reference (built before 2026-10-20)."
     sway = ref_info["sway_frames"]
     sway_txt = "; ".join(f"{fl}: " + ", ".join(f"{float(k):.0%} sway for {v} frames" for k, v in sorted(
         sway[fl].items(), key=lambda kv: -float(kv[0]))) for fl in sway)
@@ -843,6 +860,17 @@ def cmd_rl(tag: str = "main") -> Path:
                         f"{acts['FL_' + role].peak_torque:.1f} | {nom_rms[idx].max():.1f} | "
                         f"{np.abs(z['nom_qd'][:, idx]).max():.1f} |")
     fails = np.sort(z["rand_failed_at"][z["rand_failed_at"] >= 0] * ctrl_dt)
+    marg = np.array(ref_info["margins"])
+    m_every = ref_info["margins_every"] * ref_info["dt"]
+    if len(fails):
+        at = marg[np.clip((fails / m_every).astype(int), 0, len(marg) - 1)] * 100
+        t_min = marg.argmin() * m_every
+        near = int(np.sum(np.abs(fails - t_min) < 3.0) + np.sum(np.abs((ev["n_steps"] * ctrl_dt - fails) - t_min) < 3.0))
+        fail_margin_txt = (f"the reference margin where trips failed ranges {at.min():.1f}–{at.max():.1f} cm "
+                           f"(median {np.median(at):.1f}). The tightest spot ({marg.min() * 100:.2f} cm, at "
+                           f"{t_min:.0f} s) has {near} failure{'s' if near != 1 else ''} within 3 s of it.")
+    else:
+        fail_margin_txt = "no randomized trip failed."
     T = ev["n_steps"] * ctrl_dt
     mirrored = sum(1 for f in fails if f < T / 2 and np.any(np.abs((T - fails) - f) < 3.0))
     gif_md = "\n\n".join(f"**{viz._short(n)}** ({n})\n\n![]({fn})" for n, fn in gifs)
@@ -891,15 +919,16 @@ rear-first, retracing the ascent.**
 - **Landing.** A quasi-static crawl on flat ground, generated in 3D. The trunk
   walks to mid-landing, turns 90° in place, crosses to the upper flight's
   line, turns 90° more, and steps to the upper flight's start pose. The neck
-  stays folded, keeping the turning circle at 46 cm on the 89 cm landing.
-  Before each swing the trunk shifts (sways) to the smallest offset that puts
-  the centre of mass ≥ 2.5 cm inside the other three feet.
-- **Correction found while building this:** the planner's sideways sway is a
-  2D idea and ignores the ab/ad joint limit (±0.6 rad). Where a hip sits low
-  over its foot, a 5 cm sway needs more than that, and the 3D IK dragged
-  planted feet by up to 18 mm. Each shift now keeps the largest sway (in
-  quarters) that the 3D IK reaches exactly: {sway_txt}. The 3D margin left is
-  still positive everywhere (below).
+  stays folded, keeping the turning circle at {turn_d:.0f} cm on the
+  {s.flights[0].top_depth * 100:.0f} cm landing. Before each swing the trunk
+  shifts (sways) to the smallest offset that puts the centre of mass ≥ 2.5 cm
+  inside the other three feet, with the legs clear of the trunk.
+- **Sway in 3D.** The planner's sideways sway (up to 5 cm before a swing) is
+  checked in 3D since 2026-10-20: every planted leg must absorb it within its
+  ab/ad, knee and hip limits, with the rolled thigh and shin clear of the
+  stairs. The reference then keeps the largest sway, in quarters, that the 3D
+  IK reaches exactly with the legs ≥ 3 mm from the trunk and the hip stacks
+  off the stairs: {sway_txt}.
 
 ![]({f_ref})
 
@@ -907,12 +936,7 @@ rear-first, retracing the ascent.**
 
 The reference is kinematic: poses and contact timing, not forces.
 
-- **Penetration:** replayed in MuJoCo, front thighs dip up to 11 mm into a
-  bullnose at the tightest pockets. The ab/ad tilt shortens the leg's
-  side-view projection, so the IK bends the knee further than the 2D planner
-  assumed.
-- **Contact:** the physics in RL resolves this contact; the policy has to
-  live with it.
+{clearance_md}
 
 ## 2. The policy
 
@@ -939,7 +963,11 @@ e_q (joints), e_p (trunk position), e_R (trunk angle), e_f (feet) and e_v
 
   r = 0.3·exp(−mean e_q²/0.15²) + 0.2·exp(−e_p²/0.05²) + 0.15·exp(−e_R²/0.15²)
     + 0.25·exp(−mean e_f²/0.03²) + 0.1·exp(−mean e_v²/1.5²)
-    − 5·10⁻⁵ Σ τ² − 0.005 Σ Δa² − 0.1 Σ_touchdowns |v_foot|² − 0.2·[trunk or skid touching]
+    − 5·10⁻⁵ Σ τ² − 0.005 Σ Δa² − 0.1 Σ_touchdowns |v_foot|² − 0.2·[unplanned contact]
+
+Unplanned contact is anything touching the trunk or skid plate (stairs, or the
+robot's own legs) or a hip stack (motors, belt) touching anything. Legs collide
+with the trunk physically (since 2026-10-20), so a leg can't pass through it.
 
 The torque² term stands for motor heating. The touchdown-velocity term stands
 for noise; the plan asks for both.
@@ -993,19 +1021,16 @@ Conditions:
 
 ### What the failures say
 
-- **Shoves are what fails trips.** The friction sweep randomizes everything
+- **Shoves vs everything else.** The friction sweep randomizes everything
   except the shoves. Pooled over its five friction values it completes
   {sweep_k}/{sweep_n} trips ({sweep_k / sweep_n:.1%}, 95% CI {sweep_lo:.1%}–{sweep_hi:.1%}),
-  against {rand['rate']:.1%} with shoves. Friction from 0.3 to 0.8 makes little
-  difference, so the planned rubber-on-hardwood contact is not the bottleneck.
-- **The failures sit at a few fixed spots, mostly on the lower flight, and
-  in both directions.** Of the ascent failures, {mirrored} have a descent failure
-  within 3 s of the same reference pose. The descent is the ascent reversed,
-  so these are physical spots in the plan where a shove can't be recovered.
-- **It isn't the static margin.** The failures happen where the reference
-  margin is 1.6–2.1 cm. The tightest spot (0.35 cm) never fails. The cause is
-  still open: a contact event (a thigh on a bullnose, a swing foot near a
-  nosing) is the next thing to check.
+  against {rand['rate']:.1%} with a shove every 4–10 s. Across friction
+  0.3–0.8 the rate spans {min(res[f"friction {m:.1f}"]["rate"] for m in mus):.0%}–{max(res[f"friction {m:.1f}"]["rate"] for m in mus):.0%}.
+- **Where:** of the {int(np.sum(fails < T / 2))} ascent failures in the randomized
+  run, {mirrored} have a descent failure within 3 s of the same reference pose
+  (the descent is the ascent reversed, so these are spots in the plan where a
+  shove can't be recovered).
+- **Static margin at the failures:** {fail_margin_txt}
 
 ## 4. Cross-check: MJX/Warp vs CPU MuJoCo
 
@@ -1039,7 +1064,7 @@ robot. On the nominal trip, with no shoves, demand fits the actuators with the
 {chr(10).join(nom_rows)}
 
 On the nominal trip, the knee RMS torques are {nom_rms_rows} Nm. The
-Crocoddyl step reported 2.9 Nm on the transitions alone. The RL numbers
+Crocoddyl step (2026-10-16 geometry) reported 2.9 Nm on the transitions alone. The RL numbers
 include holding still and the policy's own stiffness choices.
 
 ## 6. Replays (nominal trip, MJX trace)
@@ -1067,6 +1092,423 @@ above.
 """
     (d / "report.md").write_text(md)
     return d
+
+
+OLD_RL = OUTPUTS / "2026-10-18_rl"  # the M0 gate run, placeholder hip geometry
+# The sim's geometry before the N+K redesign (2026-10-20): a 22 cm box trunk, ab/ad axes 14 cm
+# apart, leg planes 12 cm out, and no motors.
+OLD_GEOMETRY = dict(body_width=0.22, hip_width=0.14, abad_offset=0.05)
+
+
+def _cad_vs_sim(p: RobotParams, n: int = 400, seed: int = 0):
+    """Leg-to-trunk clearance of random front-left leg poses, by the CAD study's sampled model
+    (cad/cleandog_cad/design_space.py, design N+K) and by MuJoCo on the sim's MJCF (mm)."""
+    import xml.etree.ElementTree as ET
+
+    import mujoco
+
+    sys.path.insert(0, str(REPO / "cad"))
+    from cleandog_cad import design_space as ds
+
+    des = ds.with_(ds.NK, nose_half=p.trunk_nose_width / 2 * 1000)
+    root = ET.fromstring(build_scene_xml(p))
+    for g in root.iter("geom"):
+        if g.get("name", "").startswith("FL_"):
+            g.set("margin", "0.04")
+    m = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    d = mujoco.MjData(m)
+    fl = {g for g in range(m.ngeom) if m.geom(g).name.startswith("FL_")
+          and m.geom(g).name[3:] not in ("foot", "hip_motor", "knee_motor", "belt")}
+    trunk = {g for g in range(m.ngeom) if m.geom(g).name.startswith(("trunk_shell", "skid"))}
+    lips = {g for g in trunk if "lip" in m.geom(g).name}
+    rng = np.random.default_rng(seed)
+    Q = np.c_[rng.uniform(-0.6, 0.6, n), rng.uniform(-0.5, 2.6, n), rng.uniform(-2.7, -0.2, n)]
+    cad = np.full(n, np.inf)
+    for name, (frame, pts, inflate) in ds.leg_parts(des, p.leg_plane_y * 1000, 1).items():
+        if frame != "stack":  # the hip stack only rolls; its fixed 6 mm gap would hide the rest
+            cad = np.minimum(cad, ds.part_clearance(des, frame, pts, inflate, Q, 1))
+    sim = np.full(n, np.inf)
+    at_lip = np.zeros(n, bool)
+    ft = np.zeros(6)
+    for i, q in enumerate(Q):
+        d.qpos[:] = 0
+        d.qpos[2:4] = 1.0, 1.0
+        d.qpos[7:10] = q
+        mujoco.mj_kinematics(m, d)
+        for a in fl:
+            for b in trunk:
+                dist = mujoco.mj_geomDistance(m, d, a, b, 0.04, ft) * 1000
+                if dist < sim[i]:
+                    sim[i], at_lip[i] = dist, b in lips
+    return cad, sim, at_lip
+
+
+def cmd_nk(tag: str = "main") -> Path:
+    """The N+K hip layout in the sim (2026-10-20): the model, the re-plan, 3D clearances, and the
+    RL round trips against the old placeholder geometry."""
+    import json
+    import shutil
+    import xml.etree.ElementTree as ET
+
+    import matplotlib.pyplot as plt
+    import mujoco
+
+    from cleandog_sim import viz
+    from cleandog_sim.reference import SELF_CLEARANCE, STACK_CLEARANCE, Clearance, Reference
+    from cleandog_sim.render import View, render_views
+    from cleandog_sim.robot import LEGS, joint_actuation, stand_height
+    from cleandog_sim.transitions import morphology
+
+    viz.style()
+    d_new = latest("*_rl/reference.json").parent
+    out = out_dir("nk-sim")
+    ref_new = json.loads((d_new / "reference.json").read_text())
+    ref_old = json.loads((OLD_RL / "reference.json").read_text())
+    plans_new = json.loads((d_new / "plans.json").read_text())
+    plans_old = json.loads((OLD_RL / "plans.json").read_text())
+    key = tuple(ref_new["morphology"])
+    p, s = morphology(*key), StairParams()
+    p_old = p.with_(**OLD_GEOMETRY)
+    figs = {}
+
+    # -- 1. the model, next to the CAD study's render
+    root = ET.fromstring(build_scene_xml(p))
+    root.find("asset").find("material[@name='shell']").set("rgba", "0.62 0.64 0.68 1")  # visible from above
+    m_flat = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    z = stand_height(p) - 0.05
+    views = [View("iso", (0, 0, z), 0.95, -135, -22), View("front", (0, 0, z), 0.85, 180, -2),
+             View("side", (0, 0, z), 0.95, -90, -2), View("top", (0, 0, z), 0.9, -90, -70)]
+    names = render_views(m_flat, None, views, out, "model", size=(560, 640))
+    imgs = [(v.name, plt.imread(out / n)) for v, n in zip(views, names)]
+    figs["model"] = save(viz.fig_render_row(imgs, f"Sim model (MJCF), stand pose: {p.overall_width * 1000:.0f} mm "
+                                                  "wide at the thighs, notched trunk, knee motors above the hips"),
+                         out, "fig_model.png")
+    for n in names:
+        (out / n).unlink()
+    cad_png = REPO / "outputs" / "2026-10-19_design-space" / "cad_NK.png"
+    if cad_png.exists():
+        shutil.copy(cad_png, out / "cad_NK.png")
+
+    # -- 2. cross-check: the sim's MJCF against the CAD study's geometry
+    cad, sim, at_lip = _cad_vs_sim(p)
+    both = (cad < 25) & (sim < 40)  # the CAD sweep reports only a lower bound above 25 mm
+    fig, ax = plt.subplots(figsize=(5.2, 4.6))
+    ax.plot([-5, 40], [-5, 40], color=viz.MUTED, lw=0.9, ls=(0, (4, 3)))
+    ax.scatter(cad[both], sim[both], s=12, color=viz.SERIES[0])
+    ax.set_xlim(-5, 40)
+    ax.set_ylim(-5, 40)
+    ax.set_xlabel("CAD study: sampled clearance (mm)")
+    ax.set_ylabel("sim MJCF in MuJoCo: distance (mm)")
+    diff = np.abs(cad[both] - sim[both])
+    ax.set_title(f"Front-left thigh, knee pulley and shin vs trunk,\n{both.sum()} random poses: max difference "
+                 f"{diff.max():.2f} mm",
+                 fontsize=10)
+    figs["cad_sim"] = save(fig, out, "fig_cad_vs_sim.png")
+
+    # -- 3. the reference: static margin, old vs new
+    fig, ax = plt.subplots(figsize=(12, 3.2))
+    for j, (lab, r) in enumerate((("old geometry (2026-10-18)", ref_old), ("N+K (this run)", ref_new))):
+        mg = np.array(r["margins"]) * 100
+        w = max(1, int(round(2.0 / (r["dt"] * r["margins_every"]))))  # 2 s windows
+        n = len(mg) // w
+        env = mg[:n * w].reshape(n, w).min(1)
+        t = (np.arange(n) + 0.5) * w * r["dt"] * r["margins_every"]
+        ax.plot(t, env, color=viz.SERIES[j], lw=1.0, label=f"{lab}: min {mg.min():.2f} cm")
+    ax.axhline(0, color=viz.TEXT_2, lw=0.9)
+    viz.shade_segments(ax, ref_new["segments"])
+    ax.set_xlim(0, ref_new["duration"])
+    ax.set_ylim(-0.5, 6)
+    ax.set_ylabel("lowest static margin\nin each 2 s (cm)")
+    ax.set_xlabel("time along the round trip (s)")
+    ax.legend(loc="upper right", fontsize=8.5, bbox_to_anchor=(1.0, 0.9))
+    ax.set_title("Reference: COM distance inside the planted feet's support polygon (3D); > 0 holds with no "
+                 "dynamics", fontsize=10)
+    figs["margin"] = save(fig, out, "fig_margin.png")
+
+    # -- 4. clearances of every frame
+    clr = dict(np.load(d_new / "reference_clearance.npz"))
+    segs = ref_new["segments"]
+    figs["clear"] = save(viz.fig_clearance_along_trip(ref_new["dt"], clr, segs, Clearance.MARGIN * 1000,
+                                                      dict(self=SELF_CLEARANCE * 1000, stack=STACK_CLEARANCE * 1000)),
+                         out, "fig_clearance.png")
+    ref = Reference.load(d_new / "reference.npz")
+    chk = Clearance(p, s)
+    root = ET.fromstring(build_scene_xml(p, s.open_sides()))
+    m_st = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    shots = []
+    for k, short, _ in viz.CLEARANCE_PANELS:
+        f = int(np.argmin(clr[k]))
+        _, worst = chk(ref.qpos[f], detail=True)
+        part = next(n for n in worst[k] if n[:2] in LEGS)
+        dd = mujoco.MjData(m_st)
+        dd.qpos[:] = ref.qpos[f]
+        mujoco.mj_kinematics(m_st, dd)
+        leg_pos = dd.xpos[m_st.body(f"{part[:2]}_thigh").id]
+        az = 90 if part[1] == "L" else -90
+        fn = render_views(m_st, ref.qpos[f], [View(k, tuple(leg_pos), 0.95, az + 25, -15)], out, "worst",
+                          size=(480, 560))[0]
+        shots.append((f"{short}: {clr[k][f]:+.1f} mm\n{part} at {f * ref.dt:.0f} s", plt.imread(out / fn)))
+        (out / fn).unlink()
+    figs["worst"] = save(viz.fig_render_row(shots, "The closest frame of each kind (MuJoCo, walls hidden)"),
+                         out, "fig_worst.png")
+
+    # -- 5. RL, if trained and evaluated
+    have_rl = (d_new / f"eval_{tag}.json").exists()
+    rl_md = "RL not trained or evaluated yet for this reference."
+    if have_rl:
+        ev_new = json.loads((d_new / f"eval_{tag}.json").read_text())
+        ev_old = json.loads((OLD_RL / f"eval_{tag}.json").read_text())
+        tr_new = json.loads((d_new / f"train_{tag}.json").read_text())
+        tr_old = json.loads((OLD_RL / f"train_{tag}.json").read_text())
+        conds = ["gate: 1 shove per flight", "randomized", "nominal", "friction 0.3", "friction 0.4",
+                 "friction 0.5", "friction 0.6", "friction 0.8"]
+        runs = {"old geometry (2026-10-18)": ev_old["results"], "N+K (this run)": ev_new["results"]}
+        figs["succ"] = save(viz.fig_compare_success(runs, conds), out, "fig_success.png")
+        figs["train"] = save(viz.fig_compare_training({"old geometry": tr_old["curve"], "N+K": tr_new["curve"]}),
+                             out, "fig_training.png")
+        rows = []
+        for c in conds + [k for k in ev_new["results"] if k.startswith("cpu")]:
+            a, b = ev_old["results"].get(c), ev_new["results"].get(c)
+            if b is None:
+                continue
+            fa = f"{a['success']}/{a['trips']} ({a['rate']:.1%})" if a else "–"
+            ci = b.get("ci95")
+            ci_s = f" (CI {ci[0]:.1%}–{ci[1]:.1%})" if ci and b["trips"] > 1 else ""
+            rows.append(f"| {c} | {fa} | **{b['success']}/{b['trips']} ({b['rate']:.1%})**{ci_s} |")
+        acts = {ja.joint: ja for ja in joint_actuation(p)}
+        dem = []
+        for lab, dd_ in (("old", OLD_RL), ("N+K", d_new)):
+            zz = np.load(dd_ / f"eval_{tag}.npz")
+            joints = json.loads((dd_ / f"eval_{tag}.json").read_text())["joints"]
+            nj = len(joints)
+            pk = zz["nom_tau_peak"]
+            rms = np.sqrt(zz["nom_tau_ms"].mean(0))
+            vals = []
+            for role in ("abad", "hip", "knee"):
+                idx = [joints.index(f"{leg}_{role}") for leg in LEGS]
+                vals.append(f"{pk[:, idx].max():.1f} / {rms[idx].max():.1f}")
+            body = float(np.mean(zz["rand_body"])) if "rand_body" in zz else float("nan")
+            dem.append(f"| {lab} | " + " | ".join(vals) + f" | {body:.1%} |")
+        gate = ev_new["results"]["gate: 1 shove per flight"]
+        verdict = "passes" if gate["rate"] >= 0.95 else "does not pass"
+        rl_md = f"""Same pipeline, settings and budget as the 2026-10-18 gate run: PPO for
+{ev_new['policy_step'] / 1e6:.0f}M steps (old: {ev_old['policy_step'] / 1e6:.0f}M) on 4096 environments,
+with half of the episodes starting at moments of ≥ 40° trunk pitch, then
+`rl_eval.py` with the same seeds.
+
+**M0 gate (≥ 95% of round trips with one shove per flight): N+K {verdict}, with
+{gate['success']}/{gate['trips']} ({gate['rate']:.1%}, 95% CI {gate['ci95'][0]:.1%}–{gate['ci95'][1]:.1%}).**
+
+| Condition | Old geometry (2026-10-18) | N+K |
+| --- | --- | --- |
+{chr(10).join(rows)}
+
+![](fig_success.png)
+
+![](fig_training.png)
+
+Closed-loop torque on the nominal trip (no shoves, no randomization), peak / RMS
+in Nm, and the share of control steps with unplanned contact in the randomized
+trips (old: trunk or skid touching; N+K: also a leg on the trunk or a hip stack
+touching anything):
+
+| Geometry | Ab/ad | Hip | Knee | Unplanned contact |
+| --- | --- | --- | --- | --- |
+{chr(10).join(dem)}
+
+Actuator limits: ab/ad {acts['FL_abad'].peak_torque:.1f} Nm peak / {acts['FL_abad'].rated_torque:.1f} rated,
+hip and knee {acts['FL_hip'].peak_torque:.1f} / {acts['FL_hip'].rated_torque:.1f}. The full RL report for this run is
+[{d_new.name}/report.md](../{d_new.name}/report.md).
+"""
+
+    # -- tables and text
+    po = p_old
+    geo_rows = "\n".join(f"| {lab} | {a} | {b} |" for lab, a, b in (
+        ("Trunk", f"box {po.body_length * 100:.1f} × {po.body_width * 100:.0f} cm",
+         f"{p.trunk_notch_x * 200:.1f} × {p.body_width * 100:.0f} cm centre section, "
+         f"{p.trunk_nose_width * 100:.1f} cm nose and tail"),
+        ("Ab/ad axes apart (`hip_width`)", f"{po.hip_width * 100:.1f} cm", f"{p.hip_width * 100:.1f} cm"),
+        ("Leg plane offset (`abad_offset`)", f"{po.abad_offset * 100:.1f} cm", f"{p.abad_offset * 100:.2f} cm"),
+        ("Leg planes from the centreline", f"{po.leg_plane_y * 100:.1f} cm", f"{p.leg_plane_y * 100:.1f} cm"),
+        ("Hip stack", "none (mass only)", f"hip motor on the hip axis, knee motor {p.knee_motor_above * 1000:.1f} mm "
+         f"above, belt stage outboard (RobStride 02, ⌀{p.hip_motor_radius * 2000:.1f} × {p.hip_motor_length * 1000:.1f} mm)"),
+        ("Thigh", f"capsule r {po.thigh_radius * 1000:.0f} mm", f"plate {p.thigh_radius * 2000:.0f} × "
+         f"{p.thigh_half_thickness * 2000:.0f} mm, hub r {p.thigh_hub_radius * 1000:.0f}, knee pulley r "
+         f"{p.knee_pulley_radius * 1000:.0f}"),
+        ("Overall width", f"{(po.leg_plane_y + po.thigh_radius) * 200:.1f} cm at the thighs (no motors)",
+         f"{p.overall_width * 100:.1f} cm at the thighs, {(p.leg_plane_y + p.foot_radius) * 200:.0f} cm at the feet"),
+        ("Self-collision", "off: legs passed up to 21 mm into the trunk", "legs and hip stacks vs trunk"),
+    ))
+    sway_rows = []
+    for lab, r in (("old geometry", ref_old), ("N+K", ref_new)):
+        for fl in ("lower", "upper"):
+            sw = r["sway_frames"][fl]
+            tot = sum(sw.values())
+            full = sw.get("1.0", 0) / tot
+            sway_rows.append(f"| {lab}, {fl} | {full:.0%} | " + ", ".join(
+                f"{float(k):.0%}: {v}" for k, v in sorted(sw.items(), key=lambda kv: -float(kv[0])) if k != "1.0") + " |")
+    c = ref_new["clearance"]
+    run1_note = (" (That first run's data is kept here as `run1_reference.npz` and `run1_clearance.npz`; "
+                 "the current code no longer produces it.)" if (out / "run1_reference.npz").exists() else "")
+    md = f"""# The N+K hip layout in the sim: re-plan, self-collision, RL gate
+
+Generated {dt.datetime.now():%Y-%m-%d %H:%M} by `scripts/visualize.py nk` from
+`{d_new.name}` (this run) and `{OLD_RL.name}` (the M0 gate run with the placeholder
+geometry). The CAD study that chose N+K is
+[2026-10-19_design-space](../2026-10-19_design-space/report.md).
+
+## Answer
+
+{rl_md.split(chr(10) + chr(10))[1] if have_rl else "RL pending."}
+
+- **Geometry:** the sim now has the N+K trunk and hip stacks. Legs and hip
+  stacks collide with the trunk, and the hip stacks collide with the stairs.
+- **Re-plan:** both flights re-planned with the 3D sway check. The reference
+  keeps every leg ≥ {c['self']['min']:.1f} mm from the trunk and every hip stack
+  ≥ {c['stack']['min']:.1f} mm off the stairs. Its tightest static margin is
+  {min(ref_new['margins']) * 100:.2f} cm (old geometry: {min(ref_old['margins']) * 100:.2f} cm).
+- **Still open:** thighs and shins still touch nosings in the kinematic
+  reference: {c['limb']['min']:.1f} mm at worst, on {c['limb']['frames_below_0']} frames. The RL physics resolves it.
+
+## 1. The model
+
+| | Old sim (placeholder) | N+K (now) |
+| --- | --- | --- |
+{geo_rows}
+
+The MJCF (`cleandog_sim.robot`) is generated from `RobotParams`, so the planner,
+Pinocchio/Crocoddyl and RL all see it. The knee motor now rides on the ab/ad
+link, so that link's centre of mass sits {p.knee_motor_above / 2 * 1000:.0f} mm above the hip axis.
+
+![](fig_model.png)
+
+The CAD study's render of the same design, for comparison:
+
+![](cad_NK.png)
+
+**Collision classes** (a pair collides if one's contype shares a bit with the
+other's conaffinity):
+
+| Class | contype | conaffinity | Collides with |
+| --- | --- | --- | --- |
+| World (stairs, walls, floor) | 1 | 2 | every robot geom |
+| Trunk, skid plate, neck, head | 2+4 | 1 | world, legs, hip stacks |
+| Hip stack (motors, belt) | 2 | 1+4 | world, trunk |
+| Thigh, shin, foot | 2 | 1+4 | world, trunk |
+
+Legs don't collide with each other or with their own hip stack: the joints keep
+those apart by construction. MuJoCo's parent filter is off, so the hip stacks,
+which hang off the trunk body, are checked against it.
+
+**Cross-checks:**
+- **CAD vs sim:** the MJCF against the CAD study's geometry, for 400 random
+  front-left leg poses (thigh, hub, knee pulley and shin vs the trunk; the hip
+  stack's fixed 6 mm gap is left out so it doesn't mask them). The two models
+  agree to {diff.max():.2f} mm wherever both measure (below).
+- **Warp vs CPU:** on two test poses, one with a leg on the trunk and one with
+  a hip motor in the trunk, MJX's Warp backend (used for training) and CPU
+  MuJoCo reported the same contacts and depths to 0.01 mm (checked by hand on
+  2026-10-20; not rerun by this script). The nominal round trip below is the
+  ongoing cross-check.
+
+![](fig_cad_vs_sim.png)
+
+*Found while building this:* MuJoCo contacts within a geom margin are not a
+reliable distance measure. They are exact for penetration (which is all the
+physics needs), but positive distances go missing: entirely if `geom_margin` is
+set after compiling, and for some box-box pairs even when it is in the XML. A
+thigh plate 6.1 mm from the skid plate went unreported. The leg-to-trunk check
+therefore uses `mj_geomDistance` on every pair, which agrees with the CAD study
+to {diff.max():.2f} mm.
+
+## 2. The re-plan, and a planner fix the wider stance needed
+
+The planner and reference pipeline ran unchanged at first. They produced a
+reference whose tightest static margin was **0.01 cm** (old: 1.28 cm), with 255
+frames under 1 cm. It also had 1,590 frames with a thigh or shin in a nosing,
+down to −17.5 mm.{run1_note}
+
+**Why:** the planner's sideways sway (up to 5 cm before each swing, to put the
+centre of mass over the other three feet) was a 2D idea. It ignored the ab/ad
+limit and what the roll does to the leg. With the leg plane 7.15 cm from the
+ab/ad axis instead of 5 cm, a folded leg (knee near its −155° limit) needs a
+larger roll for the same sway. The reference then had to shrink sways the legs
+couldn't make, and with them the margin. Where the sway was kept, it reshaped
+planted legs: a straighter or more bent knee that the planner's zero-sway
+capsule check never saw. The penetration grew from −12.6 mm to −17.5 mm, which
+is the ratio of the two offsets (71.5 / 50 = 1.43).
+
+**Fix** (`Planner.sway_ik`, `sway_leg_ok`). For each candidate sway y, each
+planted leg is solved in 3D. The swing leg is solved at its new foothold.
+Trunk frame, foot relative to the ab/ad axis: along the body p_x, up p_z,
+outward p_y = o − s·y, where o is the leg-plane offset and s = ±1 the side.
+
+- **Roll:** the foot must lie in the rolled leg plane, so its in-plane height
+  is h = −√(p_y² + p_z² − o²). The ab/ad angle is
+  a = atan2(p_z, p_y) − atan2(h, o).
+- **Planar IK** to (p_x, h) gives the knee flexion and hip angle. The sway is
+  kept only if |a| ≤ 0.6 rad, the flexion is in [0.2, 2.7] rad and
+  |hip| ≤ 2.6 rad.
+- **Side view of the rolled leg** (exact, since the stairs don't vary across
+  their width): the hip-pitch joint sits at z = o·sin a and the knee at
+  z = o·sin a + l₁·sin(θ)·cos a, where θ is the thigh's in-plane angle. The
+  thigh capsule, the knee pulley and the shin must clear the stairs there.
+- **Checked:** a test drives MuJoCo with the angles this finds. The foot lands
+  on the foothold and the knee sits where the side view says, both to 10⁻⁶ m.
+
+| Reference | Shifts at full sway | Reduced sways (frames) |
+| --- | --- | --- |
+{chr(10).join(sway_rows)}
+
+| | Old geometry | N+K |
+| --- | --- | --- |
+| Lower flight | {plans_old['info']['lower']['moves']} moves ({plans_old['info']['lower']['seconds']:.0f} s to plan) | {plans_new['info']['lower']['moves']} moves ({plans_new['info']['lower']['seconds']:.0f} s) |
+| Upper flight | {plans_old['info']['upper']['moves']} moves ({plans_old['info']['upper']['seconds']:.0f} s) | {plans_new['info']['upper']['moves']} moves ({plans_new['info']['upper']['seconds']:.0f} s) |
+| Round trip | {ref_old['duration']:.0f} s | {ref_new['duration']:.0f} s |
+| Tightest static margin | {min(ref_old['margins']) * 100:.2f} cm | {min(ref_new['margins']) * 100:.2f} cm |
+
+![](fig_margin.png)
+
+## 3. Clearance of every reference frame
+
+`reference.Clearance` puts the reference poses into MuJoCo with the full
+collision geometry and a 5 cm detection margin on the legs. While building the
+reference, the sway search requires legs ≥ {SELF_CLEARANCE * 1000:.0f} mm from the
+trunk (the CAD study's design clearance) and hip stacks ≥ {STACK_CLEARANCE * 1000:.0f}
+mm off the stairs. The landing crawl's sway search does the same.
+
+| Kind | Minimum | Where | Closest pair | Frames below 0 |
+| --- | --- | --- | --- | --- |
+""" + "\n".join(f"| {short} | {c[k]['min']:.1f} mm | {c[k]['segment']}, {c[k]['frame'] * ref_new['dt']:.0f} s | "
+                f"{' / '.join(c[k]['pair'])} | {c[k]['frames_below_0']} |" for k, short, _ in viz.CLEARANCE_PANELS) + f"""
+
+![](fig_clearance.png)
+
+![](fig_worst.png)
+
+The thigh-nosing contact is the old reference's problem, made no worse: the
+2026-10-18 reference had thighs −12.6 mm into nosings in its own geometry. Its
+legs also passed 21 mm into the trunk, which can no longer happen.
+
+## 4. RL round trips
+
+{rl_md}
+
+## What is not modelled
+
+- **Hip geometry:** the ab/ad bracket, cables, and the belt's tension and
+  compliance. The second belt stage (thigh to knee) is inside the thigh plate.
+- **Mass and inertia:** the knee motor's mass sits on the ab/ad link, as
+  built. The rest of the mass budget is unchanged (8.5 kg total).
+- **Legs:** leg-to-leg contact is off (front and rear legs on one side never
+  overlap in the reference).
+- **Not re-run:** the morphology sweep (`transition_sweep.py`) and Crocoddyl
+  (`dynamics_run.py`) still reflect the 2026-10-16 geometry. The round-trip
+  planner re-plans every transition inside each whole flight, and the
+  closed-loop torques above replace Crocoddyl's for the actuator check.
+"""
+    (out / "report.md").write_text(md)
+    return out
 
 
 DIR_NAMES = ("forward", "forward-left", "left", "back-left", "back", "back-right", "right", "forward-right")
@@ -1400,7 +1842,7 @@ def cmd_view(args) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "rl", "rl_failures", "pitch_cap", "all"):
+    for name in ("stairs", "ladder", "bins", "transitions", "dynamics", "rl", "rl_failures", "pitch_cap", "nk", "all"):
         sub.add_parser(name)
     v = sub.add_parser("view")
     v.add_argument("--ladder", nargs=2, type=float, metavar=("SEG_CM", "GAP_CM"),
@@ -1413,7 +1855,7 @@ def main(argv=None) -> int:
         return 0
     cmds = {"stairs": cmd_stairs, "ladder": cmd_ladder, "bins": cmd_bins, "transitions": cmd_transitions,
             "dynamics": cmd_dynamics, "rl": cmd_rl, "rl_failures": cmd_rl_failures,
-            "pitch_cap": cmd_pitch_cap}
+            "pitch_cap": cmd_pitch_cap, "nk": cmd_nk}
     for name in (cmds if args.cmd == "all" else [args.cmd]):
         print(f"{name}: {cmds[name]()}/report.md")
     return 0

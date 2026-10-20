@@ -38,6 +38,7 @@ python scripts/transition_sweep.py && python scripts/visualize.py transitions   
 python scripts/dynamics_run.py && python scripts/visualize.py dynamics          # M0 step 2 (~1 min)
 python scripts/rl_reference.py && python scripts/rl_train.py                    # M0 step 3 (GPU, ~1 h)
 python scripts/rl_eval.py && python scripts/visualize.py rl                     # round trips (~25 min)
+python scripts/visualize.py nk                                                  # N+K hip layout vs old geometry (after rl)
 python scripts/rl_diagnose.py && python scripts/visualize.py rl_failures        # shove map + forensics (~10 min)
 cd .. && python cad/scripts/hip_layout_report.py                                # hip stack vs trunk (OCC kernel)
 python cad/scripts/design_space_run.py && python cad/scripts/design_space_report.py   # trunk/hip design space (~20 min, 8 cores)

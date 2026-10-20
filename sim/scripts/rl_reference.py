@@ -36,10 +36,42 @@ def plan_one(args):
     return flight, status, path, time.time() - t0
 
 
+def clearance_audit(p, s, ref, out: Path) -> dict:
+    """3D clearances of every frame (legs vs trunk, hip stacks and limbs vs the stairs): writes
+    reference_clearance.npz and returns the summary for reference.json."""
+    from cleandog_sim.reference import Clearance, audit
+
+    clr = audit(p, s, ref)
+    np.savez_compressed(out / "reference_clearance.npz", **clr)
+    chk = Clearance(p, s)
+    clearance = {}
+    for k, v in clr.items():
+        f = int(np.argmin(v))
+        _, worst = chk(ref.qpos[f], detail=True)
+        clearance[k] = dict(min=float(v[f]), frame=f, segment=ref.segment_names[ref.segment[f]],
+                            pair=list(worst.get(k, ())), frames_below_0=int((v < 0).sum()),
+                            frames_below_3=int((v < 3).sum()))
+    return clearance
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--morph", nargs=3, metavar=("SEG_CM", "KNEE", "SPACING_CM"))
+    ap.add_argument("--audit-only", action="store_true",
+                    help="re-measure the clearances of the latest reference without re-planning")
     args = ap.parse_args(argv)
+    if args.audit_only:
+        from cleandog_sim.reference import Reference
+
+        d = sorted(OUTPUTS.glob("*_rl/reference.json"))[-1].parent
+        info = json.loads((d / "reference.json").read_text())
+        ref = Reference.load(d / "reference.npz")
+        info["clearance"] = clearance_audit(morphology(*info["morphology"]), StairParams(), ref, d)
+        (d / "reference.json").write_text(json.dumps(info))
+        for k, c in info["clearance"].items():
+            print(f"  clearance {k}: min {c['min']:.1f} mm at frame {c['frame']} ({c['segment']}, {c['pair']}), "
+                  f"{c['frames_below_0']} frames below 0, {c['frames_below_3']} below 3")
+        return 0
     if args.morph:
         key = (float(args.morph[0]) / 100, args.morph[1], float(args.morph[2]) / 100)
     else:
@@ -67,6 +99,7 @@ def main(argv=None) -> int:
     ref, extra = round_trip(p, s, tup)
     ref.save(out / "reference.npz")
     margins = static_margins(pin_model(p), ref)
+    clearance = clearance_audit(p, s, ref, out)
     n_up = extra["n_up"]
     segs = []
     for i, name in enumerate(ref.segment_names):
@@ -81,9 +114,13 @@ def main(argv=None) -> int:
     (out / "reference.json").write_text(json.dumps(dict(
         morphology=key, dt=ref.dt, duration=ref.duration, n_up=n_up, segments=segs, crawl=crawl,
         sway_frames={fl: {str(k): v for k, v in d.items()} for fl, d in sway.items()},
-        margins=margins[::5].round(4).tolist(), margins_every=5,
+        margins=margins[::5].round(4).tolist(), margins_every=5, clearance=clearance,
+        clear_viol={fl: float(v.max()) for fl, v in extra["clear_viol"].items()},
         generated=dt.datetime.now().isoformat(timespec="seconds"))))
     print(f"reference: {ref.duration:.0f} s round trip, min 3D static margin {margins.min() * 100:.2f} cm -> {out}")
+    for k, c in clearance.items():
+        print(f"  clearance {k}: min {c['min']:.1f} mm at frame {c['frame']} ({c['segment']}, {c['pair']}), "
+              f"{c['frames_below_0']} frames below 0")
     return 0
 
 

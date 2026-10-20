@@ -44,7 +44,8 @@ def scene_xml(des: Design, y_leg: float) -> str:
     world.remove(world.find("body[@name='trunk']"))
     for tag in ("actuator", "sensor", "keyframe"):
         root.remove(root.find(tag))
-    ET.SubElement(root.find("option"), "flag", filterparent="disable")
+    opt = root.find("option")
+    (opt.find("flag") if opt.find("flag") is not None else ET.SubElement(opt, "flag")).set("filterparent", "disable")
     mm = 1e-3
     trunk = ET.SubElement(world, "body", name="trunk", pos="0 0 0.4")
     ET.SubElement(trunk, "freejoint", name="root_joint")

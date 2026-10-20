@@ -25,7 +25,11 @@ def test_reference_feet_hit_footholds(flat_plan):
     model = D.pin_model(p)
     data = model.createData()
     for ph in D.plan_phases(pl, path):
-        q = D.reference_q(p, model, ph.base_end, ph.feet)
+        # Without the planner's sideways sway: a full 5 cm sway can be out of 3D reach where a
+        # hip is near its limit, which reference.flight_reference handles by scaling the sway.
+        base = ph.base_end.copy()
+        base[1] = 0.0
+        q = D.reference_q(p, model, base, ph.feet)
         pin.framesForwardKinematics(model, data, q)
         for leg in ph.stance:
             err = data.oMf[model.getFrameId(f"{leg}_foot")].translation - ph.feet[leg]

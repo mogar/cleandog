@@ -11,9 +11,11 @@ A plan alternates two kinds of move:
 - **Swing:** one leg moves to a new foothold while the other three hold the
   robot up. This is a free gait: any leg may go next. A fixed crawl order
   deadlocks at the first riser. Before a swing the body may
-  sway sideways by up to `max_sway`, as real quadrupeds do in a crawl. The
-  legs' sideways reach is not checked; 5 cm is small next to the 12 cm foot
-  offset.
+  sway sideways by up to `max_sway`, as real quadrupeds do in a crawl. Each
+  sway is checked in 3D (`sway_leg_ok`): every planted leg, and the swing leg
+  at its new foothold, must absorb it within the ab/ad, knee and hip limits.
+  (Until 2026-10-20 it wasn't, and the reference had to shrink sways the legs
+  couldn't make; the wider N+K stance made that common.)
 
 Every pose must satisfy all of these:
 
@@ -53,6 +55,8 @@ from .robot import LEGS, mass_breakdown
 from .terrain import Terrain, flight_terrain, foothold_candidates
 
 G = 9.81
+ABAD_LIMIT = 0.6  # rad, the MJCF ab/ad range
+FLEX_LIMITS = (0.2, 2.7)  # rad, knee flexion range (ladder.leg_ik's default)
 NECK_OPTIONS = ((0.0, 0.0), (-0.5, 0.5), (-1.0, 1.0), (-1.45, 1.45), (-1.45, 0.3), (0.4, 0.8), (0.0, 1.4))
 HIP_LIMIT = 2.6
 
@@ -239,7 +243,15 @@ class Planner:
         pts += [(sx * hl, z) for sx in (-1, 1) for z in np.linspace(bot, top, 4)]
         loc = np.array(pts)
         world = P.centre[:, None, :] + loc[None, :, :1] * P.ex[:, None, :] + loc[None, :, 1:] * P.ez[:, None, :]
-        return ~self.t.solid(world[..., 0], world[..., 1], clearance=0.005).any(axis=1)
+        ok = ~self.t.solid(world[..., 0], world[..., 1], clearance=0.005).any(axis=1)
+        # Hip stacks, seen from the side at zero ab/ad: the hip motor round the hip axis and the
+        # knee motor above it. (Rolling with ab/ad lowers their outboard ends; the 3D check on the
+        # reference, reference.stack_and_self_clearance, covers that.)
+        for front in (True, False):
+            hip = P.hip(p, front)
+            for c in (hip, hip + P.ez * p.knee_motor_above):
+                ok &= ~self.t.solid(c[:, 0], c[:, 1], clearance=p.hip_motor_radius + 0.005)
+        return ok
 
     def neck_geometry(self, P: Poses, opt: int):
         p = self.p
@@ -307,6 +319,82 @@ class Planner:
         cross = e[..., 0] * q[..., 1] - e[..., 1] * q[..., 0]
         return (cross / np.maximum(np.hypot(e[..., 0], e[..., 1]), 1e-9)).min(axis=1)
 
+    def sway_ik(self, P: Poses, leg: str, foot, sways: np.ndarray) -> dict[str, np.ndarray]:
+        """Exact 3D leg IK with the trunk at pose P (pitch only, no roll) swayed sideways by each
+        of `sways` (k,), the foot held at `foot` (2D, planner frame). The sway moves the foot by -y
+        across the leg plane; the ab/ad roll takes that up and the planar IK reaches the foot in
+        the rolled leg plane. Returns (N, k) arrays: joint angles (abad, hip, knee, in the left
+        leg's convention), flex, h2 (< 0: unreachable) and the trunk-frame (x, z) offsets from the
+        ab/ad axis of the hip-pitch joint, knee and foot as seen from the side."""
+        p = self.p
+        o, l1, l2 = p.abad_offset, p.thigh_length, p.shin_length
+        c, s_ = np.cos(P.pitch), np.sin(P.pitch)
+        hip = P.hip(p, leg[0] == "F")
+        d = np.broadcast_to(foot, hip.shape) - hip
+        px = (c * d[:, 0] + s_ * d[:, 1])[:, None]  # trunk frame: along the body
+        pz = (-s_ * d[:, 0] + c * d[:, 1])[:, None]  # trunk frame: up (the foot is below, < 0)
+        side = 1 if leg[1] == "L" else -1
+        py = o - side * np.asarray(sways, float)[None, :]  # foot from the ab/ad axis, outward
+        h2 = py**2 + pz**2 - o**2
+        h = -np.sqrt(np.maximum(h2, 0.0))  # foot height in the rolled leg plane
+        a = np.arctan2(pz, py) - np.arctan2(h, o)
+        a = (a + np.pi) % (2 * np.pi) - np.pi
+        dist2 = px**2 + h**2
+        cos_k = (dist2 - l1**2 - l2**2) / (2 * l1 * l2)
+        flex = np.arccos(np.clip(cos_k, -1.0, 1.0))
+        k = -flex if self.knee_back[leg] else flex
+        q_hip = np.arctan2(-px, -h) - np.arctan2(l2 * np.sin(k), l1 + l2 * np.cos(k))
+        q_hip = (q_hip + np.pi) % (2 * np.pi) - np.pi
+        # Side view (the stairs don't vary across their width, so this is all the collision check
+        # needs): the hip-pitch joint rides o*sin(a) above the ab/ad axis, and the knee sits at
+        # its in-plane height times cos(a) above that.
+        dd = np.sqrt(np.maximum(dist2, 1e-12))
+        alpha = np.arccos(np.clip((l1**2 + dist2 - l2**2) / (2 * l1 * dd), -1.0, 1.0))
+        ang = np.arctan2(h, px) + (-alpha if self.knee_back[leg] else alpha)
+        lift = o * np.sin(a)
+        return dict(abad=a, hip=q_hip, knee=k, flex=flex, h2=h2, dist=np.sqrt(dist2), cos_k=cos_k,
+                    hip_xz=np.stack([np.zeros_like(lift), lift], -1),
+                    knee_xz=np.stack([l1 * np.cos(ang), lift + l1 * np.sin(ang) * np.cos(a)], -1),
+                    foot_xz=np.stack([np.broadcast_to(px, a.shape), np.broadcast_to(pz, a.shape)], -1),
+                    hip_world=hip, ex=np.stack([c, s_], -1), ez=np.stack([-s_, c], -1))
+
+    def sway_leg_ok(self, P: Poses, leg: str, foot, sways: np.ndarray, collide: bool = True) -> np.ndarray:
+        """(N, k) mask: can `leg` keep its foot planted with the trunk swayed by each of `sways`
+        (sway_ik), within the ab/ad, knee and hip limits? With `collide`, the rolled thigh, knee
+        pulley and shin must also clear the stairs: the sway reshapes the leg (a straighter or
+        more bent knee), which the zero-sway check in leg_check can't see."""
+        p = self.p
+        ik = self.sway_ik(P, leg, foot, sways)
+        a, flex = ik["abad"], ik["flex"]
+        ok = ((ik["h2"] >= 0) & (np.abs(a) <= ABAD_LIMIT) & (np.abs(ik["cos_k"]) <= 1.0)
+              & (ik["dist"] <= self.reach_2d) & (flex >= FLEX_LIMITS[0]) & (flex <= FLEX_LIMITS[1])
+              & (np.abs(ik["hip"]) <= HIP_LIMIT))
+        if not collide:
+            return ok
+        hip_t, knee_t, foot_t = ik["hip_xz"], ik["knee_xz"], ik["foot_xz"]
+        hip, ex, ez = ik["hip_world"], ik["ex"][:, None, None, :], ik["ez"][:, None, None, :]
+
+        def world(v):  # (N, k, n, 2) trunk-frame offsets from the ab/ad axis -> planner frame
+            return hip[:, None, None, :] + v[..., :1] * ex + v[..., 1:] * ez
+
+        t = np.linspace(0.0, 1.0, 12)[None, None, :, None]
+        thigh = world(hip_t[:, :, None] + t * (knee_t - hip_t)[:, :, None])
+        shin_len = np.maximum(np.linalg.norm(foot_t - knee_t, axis=-1, keepdims=True), 1e-9)
+        tt = t * np.maximum(1.0 - p.foot_radius * 1.5 / shin_len, 0.0)[:, :, None]
+        shin = world(knee_t[:, :, None] + tt * (foot_t - knee_t)[:, :, None])
+        clear = ~self.t.solid(thigh[..., 0], thigh[..., 1], clearance=p.thigh_radius).any(-1)
+        clear &= ~self.t.solid(shin[..., 0], shin[..., 1], clearance=p.shin_radius).any(-1)
+        kw = world(knee_t[:, :, None])[:, :, 0]
+        clear &= ~self.t.solid(kw[..., 0], kw[..., 1], clearance=p.knee_pulley_radius)
+        return ok & clear
+
+    def sway_feasible(self, P: Poses, feet: dict) -> np.ndarray:
+        """(N, n_sways) mask: every planted leg can absorb each of `self.sways` (sway_leg_ok)."""
+        ok = np.ones((len(P.pitch), len(self.sways)), bool)
+        for leg in LEGS:
+            ok &= self.sway_leg_ok(P, leg, feet[leg], self.sways)
+        return ok
+
     def foot_xy(self, leg: str, foot_x) -> np.ndarray:
         y = self.wy if leg[1] == "L" else -self.wy
         x = np.atleast_1d(foot_x)
@@ -330,6 +418,7 @@ class Planner:
         four = [all_xy[leg] for leg in LEGS]
         three = [all_xy[leg] for leg in LEGS if leg != lifted]
         n = len(P.pitch)
+        sway_ok = self.sway_feasible(P, feet) if lifted is not None else None
         marg, sway = np.full(n, -np.inf), np.zeros(n)
         neck, cx = np.full(n, -1), np.zeros(n)
         # The neck and head carry ~10% of the mass: fold them to whichever collision-free
@@ -342,8 +431,9 @@ class Planner:
                 # Sway the body sideways (all four feet down, so any sway between is also
                 # stable) to the y that best supports lifting this leg.
                 m_o, y_o = np.full(n, -np.inf), np.zeros(n)
-                for y in self.sways:
+                for k, y in enumerate(self.sways):
                     m = np.minimum(self.support_margin(c, three, y), self.support_margin(c, four, y))
+                    m = np.where(sway_ok[:, k], m, -np.inf)
                     m_o, y_o = np.maximum(m, m_o), np.where(m > m_o, y, y_o)
             m_o = np.where(feas[:, opt], m_o, -np.inf)
             better = m_o > marg
@@ -511,7 +601,9 @@ class Planner:
         path = np.array([[gx[a], gz[b]] for a, b in reversed(cells)])
         return np.vstack([np.asarray(f0)[None], path, np.asarray(f1)[None]])
 
-    def swing_candidates(self, pose, feet_idx, leg_i) -> list[int]:
+    def swing_candidates(self, pose, feet_idx, leg_i, sway: float | None = None) -> list[int]:
+        """Up to 3 new footholds for leg_i from `pose`; with `sway`, only footholds the leg reaches
+        in 3D with the trunk swayed that far (it holds the sway through the swing)."""
         leg = LEGS[leg_i]
         cur = self.cand[feet_idx[leg_i]]
         P = self.pose(*pose)
@@ -521,6 +613,8 @@ class Planner:
         PP = Poses(np.repeat(P.centre, len(idx), 0), np.repeat(P.pitch, len(idx)))
         ok, _ = self.leg_check(PP, leg, self.cand[idx])
         idx = idx[ok]
+        if sway is not None and len(idx):
+            idx = idx[self.sway_leg_ok(PP[:len(idx)], leg, self.cand[idx], np.array([sway]))[:, 0]]
         partner = ("R" if leg[0] == "F" else "F") + leg[1]
         px = self.cand[feet_idx[LEGS.index(partner)]][0]
         if leg[0] == "F":
@@ -581,13 +675,13 @@ class Planner:
             children = []
             # Free gait: any leg may swing next. Rear-most legs first, so ties favour a crawl.
             for leg_i in sorted(range(4), key=lambda i: self.cand[feet_idx[i]][0]):
-                ok_lift, _ = self.evaluate(P_end, feet, lifted=LEGS[leg_i])
+                ok_lift, info_lift = self.evaluate(P_end, feet, lifted=LEGS[leg_i])
                 found = 0
                 for e_i in np.flatnonzero(ok4 & ok_lift):  # in order: largest shift first
                     ds, f, r, pose1 = ends[e_i]
                     if not self.path_ok((x, z, beta), pose1, feet):
                         continue
-                    cands = self.swing_candidates(pose1, feet_idx, leg_i)[:2]
+                    cands = self.swing_candidates(pose1, feet_idx, leg_i, sway=float(info_lift["sway"][e_i]))[:2]
                     for c in cands:
                         new_idx = list(feet_idx)
                         new_idx[leg_i] = c
@@ -714,8 +808,10 @@ def turn_footprint(p: RobotParams, neck_option: int = 3) -> dict:
     Returns the corner points of the body, neck and head, and feet (x forward, y left, relative
     to the trunk centre) and the radius swept by turning in place about the trunk centre.
     """
-    hl, hw = p.body_length / 2, p.body_width / 2
-    pts = [(sx * hl, sy * hw) for sx in (-1, 1) for sy in (-1, 1)]
+    from .robot import hip_stack_outlines, trunk_outline
+
+    hl = p.body_length / 2
+    pts = [tuple(c) for c in trunk_outline(p)] + [tuple(c) for o in hip_stack_outlines(p) for c in o]
     wy = p.hip_width / 2 + p.abad_offset
     feet = [(sx * p.hip_spacing / 2, sy * (wy + p.foot_radius)) for sx in (-1, 1) for sy in (-1, 1)]
     neck_x = []

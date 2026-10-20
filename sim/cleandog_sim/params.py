@@ -61,20 +61,37 @@ ACTUATORS = {a.name: a for a in (ROBSTRIDE_02, DM_J4310P)}
 class RobotParams:
     """The ~10 parameters M0 sweeps, plus fixed mass-budget items."""
 
-    # Body (x forward, y left, z up; origin at body centre)
+    # Body (x forward, y left, z up; origin at body centre). Planform and hip layout are design
+    # N+K of the design-space study (cad/, outputs/2026-10-19_design-space, adopted 2026-10-20):
+    # a full-width centre section between the hips, a narrow nose and tail between the hip
+    # motors (corner notches), and the knee motor above the hip motor instead of coaxial.
     body_length: float = 0.378  # hip spacing + 12.8 cm (M0 transitions report, 2026-10-16)
-    body_width: float = 0.22
+    body_width: float = 0.20  # centre section; holds the ab/ad motors, battery, electronics
     body_height: float = 0.08
+    trunk_notch_x: float = 0.07975  # half-length of the full-width centre section (>= body_length/2: a box)
+    trunk_nose_width: float = 0.085  # width of the nose and tail, ahead of / behind the notches
     hip_spacing: float = 0.25  # front-rear hip pitch-axis distance (M0 transitions report)
-    hip_width: float = 0.14  # left-right ab/ad axis distance
+    hip_width: float = 0.137  # left-right ab/ad axis distance (ab/ad motor against the trunk wall)
     hip_z: float = 0.0  # hip axis height relative to body centre
-    abad_offset: float = 0.05  # lateral offset from ab/ad axis to leg plane
+    abad_offset: float = 0.0715  # lateral offset from ab/ad axis to leg plane (leg plane 14 cm out)
+
+    # Hip stack: the parts that roll with ab/ad but not with hip pitch. Inboard to outboard
+    # along y: hip-pitch motor (on the hip axis) with the knee motor above it, the first belt
+    # stage, then the thigh plate. RobStride 02 housing: 78.5 mm x 45.4 mm.
+    hip_motor_radius: float = 0.03925
+    hip_motor_length: float = 0.0454
+    knee_motor_above: float = 0.0885  # knee motor axis above the hip axis
+    belt_band: float = 0.010  # first belt stage (knee motor to hip-axis idler), along y
+    belt_radius: float = 0.016  # its pulleys; the belt envelope is a box this far round both axes
+    thigh_half_thickness: float = 0.012  # thigh plate along y; carries the second belt stage
+    thigh_hub_radius: float = 0.028  # thigh hub around the hip axis
+    knee_pulley_radius: float = 0.020
 
     # Legs
     thigh_length: float = 0.16  # M0: 13 cm proven infeasible on the transitions, 16 cm works
     shin_length: float = 0.16
     foot_radius: float = 0.02
-    thigh_radius: float = 0.018  # collision capsule radius
+    thigh_radius: float = 0.018  # half-depth of the thigh in the leg plane (planner capsule; MuJoCo box)
     shin_radius: float = 0.013
     # Sign of knee flexion about +y. -1: knee points backward (Go1/Spot style),
     # +1: knee points forward. M0 found knees must point downhill: backward knees for a
@@ -117,6 +134,23 @@ class RobotParams:
     @property
     def leg_reach(self) -> float:
         return self.thigh_length + self.shin_length
+
+    @property
+    def notched(self) -> bool:
+        return self.trunk_notch_x < self.body_length / 2
+
+    @property
+    def leg_plane_y(self) -> float:
+        return self.hip_width / 2 + self.abad_offset
+
+    def stack_y(self) -> dict[str, tuple[float, float]]:
+        """y spans (from the centreline, left side) of the hip-stack parts at zero ab/ad."""
+        y1 = self.leg_plane_y - self.thigh_half_thickness - self.belt_band
+        return {"motors": (y1 - self.hip_motor_length, y1), "belt": (y1, y1 + self.belt_band)}
+
+    @property
+    def overall_width(self) -> float:
+        return 2 * (self.leg_plane_y + self.thigh_half_thickness)
 
     @property
     def hip_above_belly(self) -> float:

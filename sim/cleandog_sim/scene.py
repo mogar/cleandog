@@ -19,7 +19,10 @@ def build_scene_xml(robot: RobotParams, stairs: StairParams | None = None,
                     timestep: float = 0.002) -> str:
     root = ET.Element("mujoco", model="cleandog")
     ET.SubElement(root, "compiler", angle="radian", autolimits="true")
-    ET.SubElement(root, "option", timestep=f"{timestep:g}", integrator="implicitfast", cone="elliptic")
+    option = ET.SubElement(root, "option", timestep=f"{timestep:g}", integrator="implicitfast", cone="elliptic")
+    # The robot's collision bits (robot.py) decide which of its parts meet; parent filtering
+    # would hide the hip stacks from the trunk they hang off.
+    ET.SubElement(option, "flag", filterparent="disable")
     ET.SubElement(root, "visual").append(ET.Element("global", offwidth="1280", offheight="720"))
 
     default = ET.SubElement(root, "default")
@@ -33,7 +36,8 @@ def build_scene_xml(robot: RobotParams, stairs: StairParams | None = None,
     ET.SubElement(asset, "material", name="floor", texture="grid", texrepeat="8 8", reflectance="0.05")
     for name, rgba in (("wood", "0.62 0.43 0.26 1"), ("wall", "0.9 0.9 0.88 0.25"),
                        ("shell", "0.95 0.95 0.93 1"), ("limb", "0.25 0.27 0.3 1"),
-                       ("foot", "0.1 0.1 0.1 1"), ("rail", "0.35 0.24 0.15 1"), ("skid", "0.85 0.85 0.95 1")):
+                       ("foot", "0.1 0.1 0.1 1"), ("rail", "0.35 0.24 0.15 1"), ("skid", "0.85 0.85 0.95 1"),
+                       ("motor", "0.16 0.47 0.84 1"), ("belt", "0.3 0.3 0.3 1")):
         ET.SubElement(asset, "material", name=name, rgba=rgba)
 
     world = ET.SubElement(root, "worldbody")

@@ -109,6 +109,104 @@ def foot_positions(model: pin.Model, data: pin.Data, q: np.ndarray) -> dict[str,
     return {leg: data.oMf[model.getFrameId(f"{leg}_foot")].translation.copy() for leg in LEGS}
 
 
+# ---------------------------------------------------------------- 3D clearance
+
+SELF_CLEARANCE = 0.003  # leg parts to the trunk, everywhere in the reference (the CAD study's 3 mm)
+STACK_CLEARANCE = 0.0  # hip stacks to the stairs
+
+
+class Clearance:
+    """MuJoCo distance queries on whole-body poses, in the full stairwell, for what the sagittal
+    planner can't see: ab/ad roll brings the legs toward the trunk and lowers the outboard end of
+    each hip stack. Per pose (mm, negative = penetration, capped at MARGIN):
+
+    - `self`: any leg or hip-stack part to the trunk, skid plate, neck or head (exact, every pair);
+    - `stack`: hip stacks (motors, belt) to the stairs, walls and floor;
+    - `limb`: thigh, hub, knee pulley and shin to the stairs (feet excluded: they stand there).
+    """
+
+    MARGIN = 0.05
+
+    def __init__(self, p: RobotParams, s: StairParams):
+        import xml.etree.ElementTree as ET
+
+        import mujoco
+
+        from .scene import build_scene_xml
+
+        # The margin must be in the XML: the compiler sizes the broadphase bounds with it, and a
+        # margin set on the compiled model is missed by the box and cylinder colliders.
+        root = ET.fromstring(build_scene_xml(p, s))
+        for g in root.find("worldbody").find("body[@name='trunk']").iter("geom"):
+            name = g.get("name", "")
+            if name[:2] in LEGS and name[2] == "_":
+                g.set("margin", f"{self.MARGIN:g}")
+        self.mj = mujoco
+        self.m = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+        self.d = mujoco.MjData(self.m)
+        m = self.m
+        trunk = m.body("trunk").id
+        robot = {g for g in range(m.ngeom) if m.body_rootid[m.geom_bodyid[g]] == trunk}
+        self.kind = np.zeros(m.ngeom, int)  # 0 world, 1 trunk class, 2 stack, 3 limb, 4 foot
+        for g in robot:
+            name = m.geom(g).name
+            if name[:2] in LEGS and name[2] == "_":
+                part = name[3:]
+                self.kind[g] = 2 if part in ("hip_motor", "knee_motor", "belt") else 4 if part == "foot" else 3
+            else:
+                self.kind[g] = 1
+        self.names = [m.geom(g).name or f"world{g}" for g in range(m.ngeom)]
+        # Leg-to-trunk distances come from mj_geomDistance on every pair: contacts within a
+        # margin are exact for penetration but can miss positive distances (box-box pairs).
+        legs = [g for g in robot if self.kind[g] in (2, 3, 4)]
+        body = [g for g in robot if self.kind[g] == 1]
+        self.self_pairs = [(a, b) for a in legs for b in body]
+        self._ft = np.zeros(6)
+
+    def __call__(self, qpos_mj: np.ndarray, detail: bool = False):
+        mj, m, d = self.mj, self.m, self.d
+        d.qpos[:] = qpos_mj
+        mj.mj_kinematics(m, d)
+        mj.mj_collision(m, d)
+        far = self.MARGIN * 1000
+        out = dict(self=far, stack=far, limb=far)
+        worst = {}
+        for a, b in self.self_pairs:
+            dist = mj.mj_geomDistance(m, d, a, b, self.MARGIN, self._ft) * 1000
+            if dist < out["self"]:
+                out["self"] = dist
+                worst["self"] = (self.names[a], self.names[b])
+        for c in d.contact[:d.ncon]:
+            k1, k2 = self.kind[c.geom1], self.kind[c.geom2]
+            ks = {k1, k2}
+            dist = float(c.dist) * 1000
+            if 1 in ks and ks & {2, 3, 4}:
+                continue  # measured exactly above
+            elif 0 in ks and 2 in ks:
+                key = "stack"
+            elif 0 in ks and 3 in ks:
+                key = "limb"
+            else:
+                continue
+            if dist < out[key]:
+                out[key] = dist
+                worst[key] = (self.names[c.geom1], self.names[c.geom2])
+        return (out, worst) if detail else out
+
+    def ok(self, qpos_mj: np.ndarray) -> tuple[bool, float]:
+        """(passes, worst violation in mm: <= 0 when it passes)."""
+        c = self(qpos_mj)
+        viol = max(SELF_CLEARANCE * 1000 - c["self"], STACK_CLEARANCE * 1000 - c["stack"])
+        return viol <= 0, viol
+
+
+def audit(p: RobotParams, s: StairParams, ref: "Reference") -> dict[str, np.ndarray]:
+    """Clearance of every reference frame (mm): see Clearance."""
+    chk = Clearance(p, s)
+    rows = [chk(q) for q in ref.qpos]
+    return {k: np.array([r[k] for r in rows]) for k in ("self", "stack", "limb")}
+
+
 # ---------------------------------------------------------------- flights
 
 def full_flight_scenario(p: RobotParams, s: StairParams, flight: str):
@@ -145,10 +243,16 @@ def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Plann
     is built with the largest sway, in quarters of the planned one, that the 3D IK
     reaches exactly. `sway_scale` on the result records what was kept; the 3D COM margin
     that remains is measured by `static_margins`.
+
+    The same search also keeps the 3D clearances (`Clearance.ok`): sway moves the trunk over the
+    feet, so the ab/ad roll it needs can bring a leg against the trunk or a hip stack down onto a
+    nosing. A group that no scale makes clear keeps the scale with the smallest violation;
+    `clear_viol` records it (mm, <= 0 is clear).
     """
     from .dynamics import plan_phases, reference_q
     from .render import planner_to_world_qpos
 
+    chk = Clearance(p, s)
     data = model.createData()
     phases = plan_phases(pl, path, T_shift, T_swing)
     frames = expand_plan(pl, path)[1:]  # one keyframe per phase, same order
@@ -180,7 +284,7 @@ def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Plann
             out.append((planner_to_world_qpos(q, s, flight, "up"), planted))
         return out, err
 
-    qs, contact, scales = [], [], []
+    qs, contact, scales, viols = [], [], [], []
     base_prev = phases[0].base_start.copy()
     i = 0
     while i < len(phases):
@@ -198,18 +302,22 @@ def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Plann
                 out += f
                 err = max(err, e)
                 n0 = n1
-            if best is None or err < best[1] - 1e-9:
-                best = (out, err, scale, end, n0)
-            if err < 1.5e-3:
+            viol = max(chk.ok(o[0])[1] for o in out)
+            score = (err >= 1.5e-3, max(viol, 0.0), err)
+            if best is None or score < best[0]:
+                best = (score, out, scale, end, n0, viol)
+            if score[:2] == (False, 0.0):
                 break
-        out, err, scale, base_prev, neck_prev = best
+        _, out, scale, base_prev, neck_prev, viol = best
         qs += [o[0] for o in out]
         contact += [o[1] for o in out]
         scales += [scale] * len(out)
+        viols += [viol] * len(out)
         i += len(group)
     q = np.array(qs)
     ref = Reference(dt, q, np.array(contact), np.zeros(len(q), int), [f"{flight} flight"])
     ref.sway_scale = np.array(scales)
+    ref.clear_viol = np.array(viols)
     return ref
 
 
@@ -258,6 +366,7 @@ class LandingCrawl:
         self.wy = p.hip_width / 2 + p.abad_offset
         self.nominal = {leg: np.array([(1 if leg[0] == "F" else -1) * p.hip_spacing / 2,
                                        self.wy if leg[1] == "L" else -self.wy, 0.0]) for leg in LEGS}
+        self.chk = Clearance(p, s)
         self.qs: list[np.ndarray] = []
         self.contact: list[list[bool]] = []
         self.log: list[dict] = []  # per swing: base, feet, margin (for the report)
@@ -335,7 +444,8 @@ class LandingCrawl:
 
     def sway_for(self, q, base_xy_yaw, feet, leg) -> tuple[np.ndarray, np.ndarray, float]:
         """Smallest sideways/fore-aft trunk offset from the target pose that puts the COM inside
-        the other three feet by MARGIN, with every foot still reachable. Returns (q, base, margin)."""
+        the other three feet by MARGIN, with every foot still reachable and the legs clear of the
+        trunk (Clearance). Returns (q, base, margin)."""
         x, y, yaw = base_xy_yaw
         stance = [feet[l][:2] for l in LEGS if l != leg]
         best = None
@@ -348,7 +458,7 @@ class LandingCrawl:
             if not self.reachable(qb, feet):
                 continue
             qb, err = self.ik(qb, feet)
-            if err > 2e-3:
+            if err > 2e-3 or not self.chk.ok(pin_to_mj(qb))[0]:
                 continue
             m = support_margin(self.com(qb)[:2], stance)
             if m >= MARGIN and (best is None or m > best[3]):
@@ -448,5 +558,6 @@ def round_trip(p: RobotParams, s: StairParams, paths: dict[str, list], dt: float
                  hold(flights["upper"].qpos[-1], all_down, hold_s, dt, "top")])
     down = up.reversed(lambda n: {"start": "finish", "top": "top"}.get(n, f"{n} (down, rear-first)"))
     extras = dict(crawl_log=crawl.log, n_up=len(up.qpos),
-                  sway_scale={fl: r.sway_scale for fl, r in flights.items()})
+                  sway_scale={fl: r.sway_scale for fl, r in flights.items()},
+                  clear_viol={fl: r.clear_viol for fl, r in flights.items()})
     return concat([up, down]), extras

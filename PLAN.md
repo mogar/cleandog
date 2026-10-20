@@ -210,7 +210,8 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
     - **Sample:** at least 100 trips.
     - **Training:** still uses a shove every 4–10 s.
   - A go/no-go on the Pupper v3 testbed (below).
-- **Status (2026-10-19): all exit items met. M0 is complete.**
+- **Status (2026-10-20): item 3 re-opened.** With the N+K hip layout and self-collision modelled, the gate drops to 168/200 (84%). See "Adopted 2026-10-20" below.
+- **Earlier status (2026-10-19): all exit items met. M0 is complete.**
   - **Item 3:** 196/200 round trips (98%) at the gate of one shove per flight, using the pitch-capped reference and a policy trained for 305M steps with extra episodes at steep moments.
   - **Without shoves:** 96–98% at every foot friction from 0.3 to 0.8.
   - **With a shove every 4–10 s:** 76.5%.
@@ -223,6 +224,15 @@ Each sim result gates the hardware above it. The M1 leg rig also feeds back into
       - **Why notches can't go further:** the front thighs swing back beside the whole mid-trunk (hip pitch to 129°), so the front leg plane must clear the centre section's wall. The rear legs never come forward of the rear hip.
       - **Stairs:** in the baseline the outboard knee motor dips 33 mm into a nosing when ab/ad tucks the leg in; N+K's motor stack clears the stairs by 13 mm.
       - **If adopted:** sim `hip_width` 0.137 m, `abad_offset` 0.0715 m (leg plane 140 mm from centre). Re-plan, add the motor stack and leg-trunk collision to the sim model, retrain. 0.7% of leg-frames have footholds that need more than ±34.4° ab/ad with the new offset (2.6% for the baseline): the re-plan moves those.
+      - **Adopted 2026-10-20.** The sim now has a notched trunk, the hip stack (hip and knee motors, belt), box thighs, and legs and stacks colliding with the trunk. The planner checks sway in 3D: ab/ad reach plus the rolled leg's clearance. Reports: `outputs/2026-10-20_nk-sim/`, `outputs/2026-10-20_rl/`, `outputs/2026-10-20_rl-failures/`.
+        - **Reference:** an 838 s round trip. Legs stay at least 3.6 mm from the trunk, and the hip stacks at least 13.3 mm from the stairs. Swing legs dip at most 0.5 mm into the stairs (was 12.6 mm). Min static margin is 1.06 cm (was 1.28).
+        - **Gate:** 168/200 (84%, CI 78–88%) after 305M steps. Without shoves it is 78–89% across friction 0.3–0.8 (was 95–97%); with shoves every 4–10 s it is 42%. Nominal 4/4, and CPU MuJoCo agrees.
+        - **Cause: thin static margin, not collisions or shoves.**
+          - **Where:** the failures cluster at a few moves (357 s and 382 s on the upper climb, 22 s and 107 s on the lower) and happen without shoves too.
+          - **How:** a backward tip-over during a front-leg swing. No trunk or stack contact comes before it, and no joint is at its torque limit.
+          - **Trigger:** the domain-randomized trunk COM offset (±2 cm). Across 2048 robots at 357 s and 382 s, the 10% with the most rearward and upward COM fail 31% of the time. The bottom half fail 0–4%. Gains, latency and friction don't predict failure.
+          - **Why worse than before:** the knee motors 88.5 mm above the hip axis raise the whole-body COM by 18.5 mm in the trunk frame. At 27–41° of nose-up pitch, that moves the COM's footprint 8–12 mm downhill. The plan now spends 10.4 s in 16 moves below 1.3 cm of margin (was 0.2 s in 2 moves).
+        - **Next:** make the planner keep a margin above the ±2 cm COM uncertainty, for example a 2 cm minimum static margin with the COM raised in the 3D check. Or lower the stack's mass (lighter knee motor, or the knee motor ahead of or behind the hip instead of above). Then re-plan and retrain.
 - **Earlier status (2026-10-18):** exit items 1, 2 and 4 met; item 3 not met yet (74.5% of round trips with shoves, 94.7% without). Reports are in `outputs/` (git-ignored); regenerate them with `sim/scripts/`.
   - **RL round trips (step 3):**
     - **Reference:** one 820 s (13.7 min) round trip, used as the reference.

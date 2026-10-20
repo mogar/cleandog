@@ -25,10 +25,11 @@ python scripts/dynamics_run.py            # Crocoddyl on the recommended morphol
 python scripts/visualize.py dynamics      # torque/speed/friction report, actuator spec, 3D replays
 
 # M0 step 3 (RL round trips; GPU):
-python scripts/rl_reference.py            # plan both whole flights, build the round-trip reference (~3 min)
+python scripts/rl_reference.py            # plan both whole flights, build the round-trip reference (~15 min)
 python scripts/rl_train.py                # PPO tracking policy on MJX/Warp, 4096 envs (~1 h for 400M steps)
 python scripts/rl_eval.py                 # whole round trips: randomized, nominal, friction sweep, CPU MuJoCo cross-check
 python scripts/visualize.py rl            # report, written into the same outputs/<date>_rl folder
+python scripts/visualize.py nk            # N+K hip layout vs the old placeholder geometry: model, re-plan, clearances, RL
 python scripts/rl_diagnose.py             # shove map along the trip + CPU forensic replays of the worst moments
 python scripts/visualize.py rl_failures   # failure-analysis report
 
@@ -39,7 +40,7 @@ python scripts/build_models.py            # write MJCF scenes to sim/models/
 | Module | What it does |
 | --- | --- |
 | `params.py` | `RobotParams` (the sweep knobs), `StairParams` (your stairwell), actuator specs |
-| `robot.py` | Parametric 12-DoF + 2-DoF neck MJCF; mass budget; stand pose |
+| `robot.py` | Parametric 12-DoF + 2-DoF neck MJCF (N+K hip layout: notched trunk, hip stacks with the knee motor above the hip, leg-to-trunk collision); mass budget; stand pose |
 | `stairs.py` | Bullnose-tread stairwell: 2D profile for analysis, plus the MJCF switchback with partition, landing walls and balusters |
 | `scene.py` | Full scene assembly and `load_model()` |
 | `ladder.py` | Ladder-posture analysis: stance stroke, static torque, belly friction, whole-body poses |
@@ -47,7 +48,7 @@ python scripts/build_models.py            # write MJCF scenes to sim/models/
 | `terrain.py` | 2D terrain for planners: shapes, walking surfaces, envelope, mirroring, cached occupancy grid |
 | `transitions.py` | Quasi-static free-gait crawl planner through the stair transitions, with verified swing paths |
 | `dynamics.py` | Crocoddyl whole-body trajectory optimisation along a plan (friction cones, torque bounds) |
-| `reference.py` | Round-trip kinematic reference: whole-flight plans, the 3D landing crawl, reversal for rear-first descent |
+| `reference.py` | Round-trip kinematic reference: whole-flight plans, the 3D landing crawl, reversal for rear-first descent; 3D clearance checks (legs vs trunk, hip stacks vs stairs) |
 | `rl.py` | MJX (Warp) tracking environment: residual PD policy, torque-speed envelope, rewards, domain randomization |
 | `viz.py`, `render.py` | Matplotlib figures and offscreen MuJoCo renders |
 

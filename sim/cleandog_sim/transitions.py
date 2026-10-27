@@ -51,13 +51,17 @@ from scipy.optimize import lsq_linear
 
 from .ladder import leg_ik
 from .params import RobotParams, StairParams
-from .robot import LEGS, mass_breakdown
+from .robot import LEGS, hip_link_inertia, mass_breakdown
 from .terrain import Terrain, flight_terrain, foothold_candidates
 
 G = 9.81
 ABAD_LIMIT = 0.6  # rad, the MJCF ab/ad range
 FLEX_LIMITS = (0.2, 2.7)  # rad, knee flexion range (ladder.leg_ik's default)
-NECK_OPTIONS = ((0.0, 0.0), (-0.5, 0.5), (-1.0, 1.0), (-1.45, 1.45), (-1.45, 0.3), (0.4, 0.8), (0.0, 1.4))
+# (neck, head) pitch relative to the trunk, positive tips down. The planner takes the collision-free
+# fold with the best margin per pose. The last four reach forward, level with a nose-up trunk, to move
+# the COM uphill (the head and neck are ~10% of the mass); indices 0-6 are fixed (NECK_FOLDED etc.).
+NECK_OPTIONS = ((0.0, 0.0), (-0.5, 0.5), (-1.0, 1.0), (-1.45, 1.45), (-1.45, 0.3), (0.4, 0.8), (0.0, 1.4),
+                (0.3, 0.3), (0.6, 0.0), (0.6, 0.6), (0.9, 0.0))
 HIP_LIMIT = 2.6
 
 
@@ -161,8 +165,15 @@ class Poses:
 
 class Planner:
     def __init__(self, p: RobotParams, sc: Scenario, margin: float = 0.02,
-                 n_heights: int = 7, budget: int = 1500, max_sway: float = 0.05, max_pitch: float | None = None):
+                 n_heights: int = 7, budget: int = 1500, max_sway: float = 0.05, max_pitch: float | None = None,
+                 prefer: float | None = None):
         self.p, self.sc, self.t, self.margin, self.budget = p, sc, sc.terrain, margin, budget
+        # Optional soft margin target (m). `margin` is a hard floor and the search is otherwise
+        # indifferent to margin, so a plan can sit just above the floor for long stretches (the
+        # N+K robot spent 42 s per ascent below 2 cm against a 1.5 cm floor, and a randomized trunk
+        # COM tipped it there). With `prefer`, moves are ranked by their worst margin (move_margin)
+        # in 5 mm steps up to `prefer`, ahead of progress.
+        self.prefer = prefer
         # Optional cap on |trunk pitch| (rad). Shoves tip the robot backward where the trunk is
         # steeper than the stairs (M0 step 3d), so a cap trades reach for robustness.
         self.max_pitch = max_pitch
@@ -285,14 +296,19 @@ class Planner:
 
     def com_parts(self, P: Poses, knees: dict, feet: dict):
         """Mass-weighted x sum and total mass of everything except the neck and head."""
-        m = self.masses
+        m, p = self.masses, self.p
         num = m["trunk"] * P.centre[:, 0]
         tot = m["trunk"]
+        # Same COMs as the MJCF: the hip stack's sits above the hip axis (the knee motor is
+        # knee_motor_above up), which on a pitched trunk moves it along the stairs.
+        hip_com_up = hip_link_inertia(p)[0][2]
+        shin_frac = (p.shin_mass / 2 + p.foot_mass) / (p.shin_mass + p.foot_mass)
         for leg in LEGS:
-            hip = P.hip(self.p, leg[0] == "F")
+            hip = P.hip(p, leg[0] == "F")
             k, f = knees[leg], np.broadcast_to(feet[leg], hip.shape)
-            num = num + m["hip_link"] * hip[:, 0] + m["thigh"] * (hip[:, 0] + k[:, 0]) / 2 \
-                + m["shin_with_foot"] * (0.4 * k[:, 0] + 0.6 * f[:, 0])
+            num = num + m["hip_link"] * (hip[:, 0] + hip_com_up * P.ez[:, 0]) \
+                + m["thigh"] * (hip[:, 0] + k[:, 0]) / 2 \
+                + m["shin_with_foot"] * ((1 - shin_frac) * k[:, 0] + shin_frac * f[:, 0])
             tot += m["hip_link"] + m["thigh"] + m["shin_with_foot"]
         return num, tot
 
@@ -400,8 +416,9 @@ class Planner:
         x = np.atleast_1d(foot_x)
         return np.stack([x, np.full_like(x, y)], -1)
 
-    def evaluate(self, P: Poses, feet: dict, lifted: str | None = None):
-        """Check poses with planted feet; `lifted` leg is ignored for reach and support.
+    def evaluate(self, P: Poses, feet: dict, lifted: str | None = None, neck: int | None = None):
+        """Check poses with planted feet; `lifted` leg is ignored for reach and support. With
+        `neck`, only that NECK_OPTIONS fold is considered (otherwise the best one is chosen).
 
         Returns (ok (N,), info dict)."""
         ok = self.trunk_clear(P)
@@ -418,12 +435,13 @@ class Planner:
         four = [all_xy[leg] for leg in LEGS]
         three = [all_xy[leg] for leg in LEGS if leg != lifted]
         n = len(P.pitch)
+        opts = range(feas.shape[1]) if neck is None else (neck,)
         sway_ok = self.sway_feasible(P, feet) if lifted is not None else None
         marg, sway = np.full(n, -np.inf), np.zeros(n)
         neck, cx = np.full(n, -1), np.zeros(n)
         # The neck and head carry ~10% of the mass: fold them to whichever collision-free
         # pose gives the best stability margin (head back when going downhill).
-        for opt in range(feas.shape[1]):
+        for opt in opts:
             c = self.com_x(P, knees, feet, opt)
             if lifted is None:
                 m_o, y_o = self.support_margin(c, four), np.zeros(n)
@@ -631,6 +649,64 @@ class Planner:
         order = np.lexsort((-self.cand[idx, 0], ~comfy))  # comfortable first, then farthest
         return [int(i) for i in idx[order][:3]]
 
+    def _tier(self, m):
+        """Margin graded in 5 mm steps, capped at `prefer` (larger is better)."""
+        return np.floor(np.minimum(m, self.prefer) / 0.005 + 1e-9)
+
+    def move_margins(self, feet_idx, child, neck: int | None = None) -> list[float]:
+        """The four static margins of move_margin, with the best fold or the given `neck`."""
+        P = self.pose(*child[:3])
+        old, new = self.feet_of(feet_idx), self.feet_of(child[5])
+        leg = next((l for l, a, b in zip(LEGS, feet_idx, child[5]) if a != b), None)
+        ms = [self.evaluate(P, old, neck=neck)[1]["margin"][0], self.evaluate(P, new, neck=neck)[1]["margin"][0]]
+        if leg:
+            ms += [self.evaluate(P, old, lifted=leg, neck=neck)[1]["margin"][0],
+                   self.evaluate(P, new, lifted=leg, neck=neck)[1]["margin"][0]]
+        return ms
+
+    def move_margin(self, feet_idx, child) -> float:
+        """Worst static margin over one move: the shift to the child's pose (all four feet on the
+        old footholds), the swing leg lifting there, the same leg about to touch down on its new
+        foothold (its mass has moved forward, toward the edge of the other three feet: up to
+        0.57 cm on the N+K robot), and the four feet down after the swing. Lift and touchdown use
+        the best sway for each, which the reference holds within ~1 mm."""
+        return float(min(self.move_margins(feet_idx, child)))
+
+    def smooth_necks(self, path: list, slack: float = 0.0025) -> list[int]:
+        """One NECK_OPTIONS fold per path state (index 0: the start pose), held from that move's
+        shift through its swing, chosen for the least total neck motion over the plan (Viterbi,
+        cost = largest joint change, rad). Per move, a fold is allowed if its worst margin
+        (move_margins) clears the floor and comes within `slack` of the best fold's, capped at
+        `prefer`. Picking the best fold per pose instead switched the neck by 0.5-2.35 rad on most
+        moves (run 6), and the policy failed on one of those swings."""
+        n_opt = len(NECK_OPTIONS)
+        _, start = self.evaluate(self.pose(*path[0][:3]), self.feet_of(path[0][5]))
+        allowed = [{int(start["neck"][0]): float(start["margin"][0])}]
+        cap = np.inf if self.prefer is None else self.prefer
+        for a, b in zip(path[:-1], path[1:]):
+            m = np.array([min(self.move_margins(a[5], b, neck=o)) for o in range(n_opt)])
+            best = m.max()
+            ok = (m >= self.margin) & (m >= min(best, cap) - slack)
+            allowed.append({o: float(m[o]) for o in (np.flatnonzero(ok) if ok.any() else [int(m.argmax())])})
+        vec = np.array(NECK_OPTIONS)
+        step = lambda i, j: float(np.abs(vec[i] - vec[j]).max())
+        # cost to reach each allowed fold; ties go to the fold with more margin
+        cost = [{o: -1e-3 * m for o, m in allowed[0].items()}]
+        back = [{}]
+        for k in range(1, len(allowed)):
+            ck, bk = {}, {}
+            for o, m in allowed[k].items():
+                prev = min(cost[k - 1], key=lambda p: cost[k - 1][p] + step(p, o))
+                ck[o], bk[o] = cost[k - 1][prev] + step(prev, o) - 1e-3 * m, prev
+            cost.append(ck)
+            back.append(bk)
+        o = min(cost[-1], key=cost[-1].get)
+        out = [int(o)]
+        for k in range(len(allowed) - 1, 0, -1):
+            o = back[k][o]
+            out.append(int(o))
+        return out[::-1]
+
     def plan(self, time_limit: float = 60.0, goal=None):
         """Depth-first search. Returns (list of states, status string).
 
@@ -670,14 +746,18 @@ class Planner:
                             key=lambda c: abs(c[0] - fi) + abs(c[1] - ri))
             ends = [(ds, f, r, self.target(x + ds, self.hs[f], self.hs[r])) for ds in deltas for f, r in combos]
             P_end = self.pose(*np.array([e[3] for e in ends]).T)
-            ok4, _ = self.evaluate(P_end, feet)
+            ok4, info4 = self.evaluate(P_end, feet)
 
             children = []
             # Free gait: any leg may swing next. Rear-most legs first, so ties favour a crawl.
             for leg_i in sorted(range(4), key=lambda i: self.cand[feet_idx[i]][0]):
                 ok_lift, info_lift = self.evaluate(P_end, feet, lifted=LEGS[leg_i])
                 found = 0
-                for e_i in np.flatnonzero(ok4 & ok_lift):  # in order: largest shift first
+                order = np.flatnonzero(ok4 & ok_lift)  # largest shift first
+                if self.prefer is not None:  # then, ahead of that, the most margin (stable sort)
+                    pre = np.minimum(info4["margin"][order], info_lift["margin"][order])
+                    order = order[np.argsort(-self._tier(pre), kind="stable")]
+                for e_i in order:
                     ds, f, r, pose1 = ends[e_i]
                     if not self.path_ok((x, z, beta), pose1, feet):
                         continue
@@ -696,7 +776,8 @@ class Planner:
                 P = self.pose(*c[:3])
                 cf = self.feet_of(c[5])
                 can_lift = any(self.evaluate(P, cf, lifted=l)[0][0] for l in LEGS)
-                return (not can_lift, -(c[0] + self.cand[list(c[5]), 0].mean()))
+                tier = 0.0 if self.prefer is None else -self._tier(self.move_margin(feet_idx, c))
+                return (not can_lift, tier, -(c[0] + self.cand[list(c[5]), 0].mean()))
 
             children = sorted(children, key=rank)[:8]
             for c in reversed(children):  # best first off the stack
@@ -737,13 +818,14 @@ def foot_forces(com_x: float, stance: dict[str, np.ndarray], wy: float, weight: 
     return dict(zip(legs, sol.x))
 
 
-def expand_plan(pl: Planner, path: list) -> list[Frame]:
+def expand_plan(pl: Planner, path: list, necks: list[int] | None = None) -> list[Frame]:
     """Turn search states into keyframes: each step is a body shift (worst case: the next
-    leg about to lift) followed by a swing."""
+    leg about to lift) followed by a swing. With `necks` (Planner.smooth_necks), each state's
+    shift and swing use that fold instead of the best one per keyframe."""
     frames = []
     weight = pl.p.total_mass_target * G
     prev = None
-    for st in path:
+    for i, st in enumerate(path):
         x, z, beta, fi, ri, feet_idx = st
         feet = pl.feet_of(feet_idx)
         if prev is None:
@@ -757,7 +839,7 @@ def expand_plan(pl: Planner, path: list) -> list[Frame]:
                 steps.append(("swing", feet, None, old[leg]))
         for kind, use_feet, lifted, swing_from in steps:
             P = pl.pose(x, z, beta)
-            ok, info = pl.evaluate(P, use_feet, lifted=lifted)
+            ok, info = pl.evaluate(P, use_feet, lifted=lifted, neck=None if necks is None else necks[i])
             stance = {l: use_feet[l] for l in LEGS if l != lifted}
             forces = foot_forces(float(info["com_x"][0]), stance, pl.wy, weight)
             torques = {}

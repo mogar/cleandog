@@ -10,7 +10,8 @@ The pieces:
 
 - **Flights:** the step-1 planner, run from floor to top of each whole flight
   (not just the transitions), turned into timed whole-body poses with the
-  same phase timing as the Crocoddyl step (dynamics.plan_phases).
+  phases of the Crocoddyl step (dynamics.plan_phases), with each shift
+  slowed to `SHIFT_RATES`.
 - **Landing:** a quasi-static crawl on flat ground in 3D, generated here. The
   trunk follows straight segments and turns in place with the neck folded.
   Before each swing the trunk shifts (sways) so the centre of mass is inside
@@ -219,23 +220,55 @@ def flight_planner(p: RobotParams, s: StairParams, flight: str) -> Planner:
     """Whole-flight planner with |trunk pitch| capped at the stair slope. Shoves tip the robot
     backward where the trunk is steeper than the stairs, and the cap costs nothing for the
     16 cm robot (M0 step 3e, outputs/*_pitch-cap). It can't go lower: mid-flight the trunk
-    lies along the stairs."""
-    return Planner(p, full_flight_scenario(p, s, flight), budget=20000, max_pitch=s.slope)
+    lies along the stairs.
+
+    Static margin floor FLIGHT_MARGIN: 1.5 cm is the most both flights plan with for the N+K robot
+    (2 cm does not plan within an hour; 2026-10-20). It covers most of the trunk-COM randomization
+    (whole-body COM shift up to ~1 cm), which tipped the robot backward at 1.1 cm."""
+    return Planner(p, full_flight_scenario(p, s, flight), margin=FLIGHT_MARGIN, budget=20000, max_pitch=s.slope,
+                   prefer=FLIGHT_PREFER)
 
 
-def plan_flight(p: RobotParams, s: StairParams, flight: str, time_limit: float = 1800.0):
+FLIGHT_MARGIN = 0.015
+# Soft target above the floor (Planner.prefer): the run-4 probe found the N+K robot tipping forward
+# where the plan sat at 1.6-2.0 cm for seconds, with the randomized trunk COM taking ~0.9 cm of it.
+FLIGHT_PREFER = 0.025
+
+
+def plan_flight(p: RobotParams, s: StairParams, flight: str, time_limit: float = 3600.0):
     pl = flight_planner(p, s, flight)
     path, status = pl.plan(time_limit=time_limit)
     return pl, path, status
 
 
+# Shift timing: each shift takes at least SHIFT_MIN_S, and long enough that the trunk pitches at
+# most 10 deg/s, the neck turns at most 1.2 rad/s and the trunk travels (x, z) at most 0.1 m/s on
+# average. A fixed 1 s shift put a 15 deg pitch, a 9 cm rise and a 1-2 rad neck swing into one
+# second, and the run-3 failures sit on those shifts. The rates slow the biggest ~20% of shifts by
+# 1.5-3x and speed up the small ones, +21 s over both flights (inside 20 s per step).
+SHIFT_RATES = dict(pitch=math.radians(10.0), neck=1.2, travel=0.1)
+SHIFT_MIN_S = 0.8
+
+
+def shift_duration(base_start, base_end, neck0, neck1) -> float:
+    """Flight shift, bases (x, sway, z, pitch): the sway is left out of the travel."""
+    d = np.asarray(base_end) - np.asarray(base_start)
+    return rate_duration(d[3], np.abs(neck1 - neck0).max(), math.hypot(d[0], d[2]))
+
+
+def rate_duration(d_pitch, d_neck, travel, min_s: float = SHIFT_MIN_S) -> float:
+    return max(min_s, abs(d_pitch) / SHIFT_RATES["pitch"], float(d_neck) / SHIFT_RATES["neck"],
+               travel / SHIFT_RATES["travel"])
+
+
 def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Planner, path: list, flight: str,
-                     dt: float = 0.02, T_shift: float = 1.0, T_swing: float = 0.8) -> Reference:
+                     dt: float = 0.02, T_swing: float = 0.8) -> Reference:
     """Timed whole-body poses along a planner path, in the world frame.
 
-    The trunk moves with a smooth (cosine) profile during shifts; swing feet follow the
-    planner's collision-free swing paths. The neck takes the fold the planner chose for
-    each pose, blended during shifts and held during swings.
+    The trunk moves with a smooth (cosine) profile during shifts, timed by `shift_duration`; swing feet follow the
+    planner's collision-free swing paths. The neck takes the fold `Planner.smooth_necks` picks
+    for each move (least total neck motion within 2.5 mm of the best margin), blended during
+    shifts and held during swings.
 
     The planner's sideways sway is a 2D idea: it doesn't know the ab/ad joint limits
     (+-0.6 rad). Where a hip sits low over its foot, a 5 cm sway would need more than
@@ -248,17 +281,38 @@ def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Plann
     feet, so the ab/ad roll it needs can bring a leg against the trunk or a hip stack down onto a
     nosing. A group that no scale makes clear keeps the scale with the smallest violation;
     `clear_viol` records it (mm, <= 0 is clear).
+
+    After clearance, the search keeps the planner's margin floor (FLIGHT_MARGIN) in 3D, over every
+    frame of the group, not just the keyframes the planner checked: less sway can leave the COM too
+    close to the edge of the stance triangle, and where the planned sway itself falls short in 3D
+    (diagonal edges), up to 1.5x the planned sway is tried. `margin_short` records what no scale
+    recovers (m).
     """
     from .dynamics import plan_phases, reference_q
     from .render import planner_to_world_qpos
 
     chk = Clearance(p, s)
     data = model.createData()
-    phases = plan_phases(pl, path, T_shift, T_swing)
-    frames = expand_plan(pl, path)[1:]  # one keyframe per phase, same order
+    folds = pl.smooth_necks(path)
+    phases = plan_phases(pl, path, 1.0, T_swing, necks=folds)
+    frames = expand_plan(pl, path, necks=folds)[1:]  # one keyframe per phase, same order
     assert len(frames) == len(phases)
     necks = [np.array(NECK_OPTIONS[f.neck]) for f in frames]
-    neck_prev = np.array(NECK_OPTIONS[expand_plan(pl, path[:1])[0].neck])
+    neck_prev = np.array(NECK_OPTIONS[folds[0]])
+    held = neck_prev  # a swing holds the fold of the shift before it (its own keyframe is the next pose's)
+    for j, ph in enumerate(phases):
+        if ph.kind == "shift":
+            phases[j] = dataclasses.replace(ph, duration=shift_duration(ph.base_start, ph.base_end, held, necks[j]))
+            held = necks[j]
+
+    def margin(out):
+        lo = np.inf
+        for q, c in out:
+            qp = mj_to_pin(q)
+            feet = foot_positions(model, data, qp)
+            com = pin.centerOfMass(model, data, qp)[:2]
+            lo = min(lo, support_margin(com, [feet[l][:2] for l, on in zip(LEGS, c) if on]))
+        return lo
 
     def phase_frames(ph, base_start, base_end, neck0, neck1, first):
         n = max(2, int(round(ph.duration / dt)))
@@ -284,13 +338,13 @@ def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Plann
             out.append((planner_to_world_qpos(q, s, flight, "up"), planted))
         return out, err
 
-    qs, contact, scales, viols = [], [], [], []
+    qs, contact, scales, viols, shorts = [], [], [], [], []
     base_prev = phases[0].base_start.copy()
     i = 0
     while i < len(phases):
         group = [i] + ([i + 1] if i + 1 < len(phases) and phases[i + 1].kind == "swing" else [])
         best = None
-        for scale in (1.0, 0.75, 0.5, 0.25, 0.0):
+        for scale in (1.0, 0.75, 0.5, 0.25, 0.0, 1.1, 1.2, 1.35, 1.5):  # more than planned only if nothing else holds
             end = phases[i].base_end.copy()
             end[1] *= scale
             out, err, n0 = [], 0.0, neck_prev
@@ -303,21 +357,24 @@ def flight_reference(p: RobotParams, s: StairParams, model: pin.Model, pl: Plann
                 err = max(err, e)
                 n0 = n1
             viol = max(chk.ok(o[0])[1] for o in out)
-            score = (err >= 1.5e-3, max(viol, 0.0), err)
+            short = max(FLIGHT_MARGIN - margin(out), 0.0)
+            score = (err >= 1.5e-3, max(viol, 0.0), short, err)
             if best is None or score < best[0]:
                 best = (score, out, scale, end, n0, viol)
-            if score[:2] == (False, 0.0):
+            if score[:3] == (False, 0.0, 0.0):
                 break
-        _, out, scale, base_prev, neck_prev, viol = best
+        (_, _, short, _), out, scale, base_prev, neck_prev, viol = best
         qs += [o[0] for o in out]
         contact += [o[1] for o in out]
         scales += [scale] * len(out)
         viols += [viol] * len(out)
+        shorts += [short] * len(out)
         i += len(group)
     q = np.array(qs)
     ref = Reference(dt, q, np.array(contact), np.zeros(len(q), int), [f"{flight} flight"])
     ref.sway_scale = np.array(scales)
     ref.clear_viol = np.array(viols)
+    ref.margin_short = np.array(shorts)
     return ref
 
 
@@ -402,13 +459,17 @@ class LandingCrawl:
         self.contact.append(list(planted))
 
     def shift(self, q0, base1, feet, neck1=None):
-        """Move the trunk from q0's pose to base1 = (x, y, z, yaw, pitch) with all feet planted."""
+        """Move the trunk from q0's pose to base1 = (x, y, z, yaw, pitch) with all feet planted, in
+        T_shift or longer at SHIFT_RATES (yaw counts as pitch). Most crawl shifts are small; the
+        first (levelling from the flight) and the last (into the upper flight's pose) are not."""
         x0 = np.array([*q0[:3], *self._yaw_pitch(q0)])
         x1 = np.array(base1, float)
         x1[3] = x0[3] + (x1[3] - x0[3] + math.pi) % (2 * math.pi) - math.pi  # shortest way round
         neck0 = q0[-2:].copy()
         neck1 = neck0 if neck1 is None else np.asarray(neck1)
-        n = max(2, int(round(self.T_shift / self.dt)))
+        T = rate_duration(max(abs(x1[3] - x0[3]), abs(x1[4] - x0[4])), np.abs(neck1 - neck0).max(),
+                          float(np.linalg.norm(x1[:3] - x0[:3])), min_s=self.T_shift)
+        n = max(2, int(round(T / self.dt)))
         q = q0
         for k in range(1, n + 1):
             b = x0 + smooth(k / n) * (x1 - x0)
@@ -491,6 +552,9 @@ class LandingCrawl:
         yaw0, _ = self._yaw_pitch(q_start)
         yawg, pitch_g = self._yaw_pitch(q_goal)
         path = self.waypoints((q_start[0], q_start[1], yaw0), (q_goal[0], q_goal[1], yawg))
+        # The flight can end with the feet staggered fore-aft: square the stance up in place first
+        # (the first swings target the start pose's nominal footprint).
+        path = [path[0]] * 5 + path
         folded = np.array(NECK_OPTIONS[NECK_FOLDED])
         # Level the trunk at standing height and fold the neck, feet where the flight left them.
         q = self.shift(q_start, (q_start[0], q_start[1], self.z_ground + self.h, yaw0, 0.0), feet, folded)
@@ -510,7 +574,19 @@ class LandingCrawl:
                 if done_path and all(np.linalg.norm(feet[l] - goal_feet[l]) < 1e-3 for l in LEGS):
                     break
                 continue
-            qb, base, m = self.sway_for(q, path[k], feet, leg)
+            # A stance left by the flight (feet far apart fore-aft) can leave too little support
+            # for the scheduled leg: then lift the first other leg that still has to move.
+            for cand in [leg] + [l for l in order if l != leg]:
+                if cand != leg and np.linalg.norm(feet[cand] - targets[cand]) < 1e-3:
+                    continue
+                try:
+                    qb, base, m = self.sway_for(q, path[k], feet, cand)
+                except RuntimeError:
+                    continue
+                leg = cand
+                break
+            else:
+                raise RuntimeError(f"no leg can lift with {MARGIN} m margin (swing {len(self.log)})")
             q = self.shift(q, base, feet)
             q, feet = self.swing(q, feet, leg, targets[leg])
             self.log.append(dict(base=base.copy(), feet={l: f.copy() for l, f in feet.items()}, leg=leg, margin=m,
@@ -559,5 +635,6 @@ def round_trip(p: RobotParams, s: StairParams, paths: dict[str, list], dt: float
     down = up.reversed(lambda n: {"start": "finish", "top": "top"}.get(n, f"{n} (down, rear-first)"))
     extras = dict(crawl_log=crawl.log, n_up=len(up.qpos),
                   sway_scale={fl: r.sway_scale for fl, r in flights.items()},
-                  clear_viol={fl: r.clear_viol for fl, r in flights.items()})
+                  clear_viol={fl: r.clear_viol for fl, r in flights.items()},
+                  margin_short={fl: r.margin_short for fl, r in flights.items()})
     return concat([up, down]), extras

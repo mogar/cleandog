@@ -87,19 +87,20 @@ def swing_reference(pl: Planner, pose, leg: str, f0_2d, f1_2d, n: int = 40) -> n
     return np.stack([np.interp(s_t, s_cum, path[:, 0]), np.interp(s_t, s_cum, path[:, 1])], 1)
 
 
-def plan_phases(pl: Planner, path: list, T_shift: float = 1.0, T_swing: float = 0.8) -> list[Phase]:
+def plan_phases(pl: Planner, path: list, T_shift: float = 1.0, T_swing: float = 0.8,
+                necks: list[int] | None = None) -> list[Phase]:
     wy = pl.wy
     to3 = {leg: (lambda f, leg=leg: np.array([f[0], wy if leg[1] == "L" else -wy, f[1]])) for leg in LEGS}
     phases = []
     prev_base = None
-    for a, b in zip(path[:-1], path[1:]):
+    for k, (a, b) in enumerate(zip(path[:-1], path[1:]), 1):
         fa, fb = pl.feet_of(tuple(a[5])), pl.feet_of(tuple(b[5]))
         moved = [l for l in LEGS if not np.allclose(fa[l], fb[l])]
         leg = moved[0] if moved else None
         # Sway: the y offset that best supports lifting `leg` at the shifted pose.
         sway = 0.0
         if leg:
-            _, info = pl.evaluate(pl.pose(*b[:3]), fa, lifted=leg)
+            _, info = pl.evaluate(pl.pose(*b[:3]), fa, lifted=leg, neck=None if necks is None else necks[k])
             sway = float(info["sway"][0])
         start = prev_base if prev_base is not None else np.array([a[0], 0.0, a[1], a[2]])
         end = np.array([b[0], sway, b[1], b[2]])

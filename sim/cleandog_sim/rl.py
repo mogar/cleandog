@@ -80,6 +80,15 @@ def default_config() -> config_dict.ConfigDict:
         # Start more episodes where the trunk is steep: shoves tip the robot there (M0 step 3d).
         steep_start_deg=40.0,
         steep_start_weight=3.0,
+        # ... and in the seconds before hard moments of the reference: thin static margin, or one of
+        # the biggest neck swings (the shift rates cap the neck at ~1.9 rad/s peak; 1.8 is the top
+        # ~1% of frames). Episodes are 20 s long out of a ~870 s round trip, so a single hard move is
+        # otherwise seldom trained (run 6: one seed never learned one, 2026-10-21). These windows
+        # cover ~19% of the round trip and get ~40% of the starts.
+        hard_start_margin=0.016,  # m, 3D static margin below this (~2% of frames)
+        hard_start_neck_rate=1.8,  # rad/s, either neck joint
+        hard_start_lead=(1.0, 3.0),  # s: start this long before the hard frame
+        hard_start_weight=3.0,
         impl="warp",
         # Who records CUDA graphs for the Warp physics: "warp" (MJX's GPU default), "jax" or "none".
         graph_mode="warp",
@@ -140,6 +149,26 @@ def ref_arrays(m: mujoco.MjModel, ref: Reference) -> RefArrays:
         mujoco.mj_kinematics(m, d)
         feet[i] = d.site_xpos[sites]
     return RefArrays(ref.qpos, qvel, ref.contact.astype(np.float32), feet, ref.segment)
+
+
+def hard_frames(m: mujoco.MjModel, ref: RefArrays, config) -> np.ndarray:
+    """(N,) bool: reference frames with a 3D static margin below config.hard_start_margin (COM to the
+    planted feet's support polygon, top view, as reference.static_margins), or a neck joint speed
+    above config.hard_start_neck_rate."""
+    from .reference import support_margin
+
+    d = mujoco.MjData(m)
+    trunk = m.body("trunk").id
+    n = len(ref.qpos)
+    margin = np.empty(n)
+    for i, q in enumerate(ref.qpos):
+        d.qpos[:] = q
+        mujoco.mj_kinematics(m, d)
+        mujoco.mj_comPos(m, d)
+        planted = [ref.feet[i, j, :2] for j in range(4) if ref.contact[i, j] > 0.5]
+        margin[i] = support_margin(d.subtree_com[trunk, :2], planted)
+    neck_rate = np.abs(ref.qvel[:, -2:]).max(1)  # neck_pitch, head_pitch
+    return (margin < config.hard_start_margin) | (neck_rate > config.hard_start_neck_rate)
 
 
 # ---------------------------------------------------------------- small maths
@@ -225,6 +254,13 @@ class StairTrack(mjx_env.MjxEnv):
         w, x, y, z = self.ref.qpos[:, 3:7].T
         self.ref_pitch = np.degrees(np.abs(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))))
         weights = np.where(self.ref_pitch >= config.steep_start_deg, config.steep_start_weight, 1.0)
+        self.hard = hard_frames(m, self.ref, config)
+        lo, hi = (int(round(s / ref.dt)) for s in config.hard_start_lead)
+        near = np.zeros(self.N, bool)
+        for i in np.flatnonzero(self.hard):  # frames from which the hard frame comes 1-3 s later
+            near[(i - np.arange(lo, hi + 1)) % self.N] = True
+        self.hard_start = near
+        weights = np.maximum(weights, np.where(near, config.hard_start_weight, 1.0))
         self._start_logits = jp.array(np.log(weights / weights.sum()), jp.float32)
 
     # -- required properties

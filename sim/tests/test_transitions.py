@@ -96,3 +96,63 @@ def test_sway_ik_matches_mujoco():
             assert knee == pytest.approx(side, abs=1e-6)
         checked += 1
     assert checked >= 10
+
+
+def test_com_matches_mujoco():
+    """The planner's 2D COM (Planner.com_x, which sets every stability margin it plans with)
+    against MuJoCo's whole-body COM, for each neck fold: the same masses at the same places,
+    including the hip stack's COM above the hip axis."""
+    import mujoco
+
+    from cleandog_sim import RobotParams, load_model
+    from cleandog_sim.robot import LEGS
+    from cleandog_sim.transitions import NECK_OPTIONS, Poses
+
+    p = RobotParams()
+    t = Terrain([Rect(-3, 3, -0.05, 0)], [Surface(-3, 3, 0, 0)], None)
+    pl = Planner(p, Scenario("lower", "bottom", "up", t, 8, -1.0, (0,), (0,)))
+    m = load_model(p)
+    d = mujoco.MjData(m)
+    neck, head = (m.jnt_qposadr[m.joint(j).id] for j in ("neck_pitch", "head_pitch"))
+    rng = np.random.default_rng(5)
+    checked = 0
+    for _ in range(20):
+        P = Poses(np.array([[0.0, rng.uniform(0.18, 0.26)]]), np.array([rng.uniform(-0.7, 0.7)]))
+        feet = {leg: P.hip(p, leg[0] == "F")[0] + [rng.uniform(-0.08, 0.08), -rng.uniform(0.12, 0.25)] for leg in LEGS}
+        iks = {leg: pl.sway_ik(P, leg, feet[leg], np.zeros(1)) for leg in LEGS}
+        knees = {leg: pl.leg_check(P, leg, feet[leg])[1] for leg in LEGS}
+        if not all(pl.sway_leg_ok(P, leg, feet[leg], np.zeros(1), collide=False)[0, 0] for leg in LEGS):
+            continue
+        d.qpos[:] = 0
+        d.qpos[:3] = P.centre[0, 0], 0, P.centre[0, 1]
+        d.qpos[3:7] = np.cos(P.pitch[0] / 2), 0, -np.sin(P.pitch[0] / 2), 0
+        for i, leg in enumerate(LEGS):
+            d.qpos[8 + 3 * i:10 + 3 * i] = iks[leg]["hip"][0, 0], iks[leg]["knee"][0, 0]
+        for opt, (nr, hr) in enumerate(NECK_OPTIONS):
+            d.qpos[neck], d.qpos[head] = nr, hr
+            mujoco.mj_kinematics(m, d)
+            mujoco.mj_comPos(m, d)
+            assert pl.com_x(P, knees, feet, opt)[0] == pytest.approx(d.subtree_com[m.body("trunk").id][0], abs=1e-6)
+        checked += 1
+    assert checked >= 8
+
+
+def test_smooth_necks_moves_less_and_keeps_margin():
+    """smooth_necks picks folds within its slack of each move's best margin, never below the floor,
+    and moves the neck no more than taking the best fold per move."""
+    from cleandog_sim.transitions import NECK_OPTIONS
+
+    pl = Planner(RobotParams(), flat_scenario(), prefer=0.025)
+    path, status = pl.plan(goal=lambda st: st[0] > -0.6, time_limit=60)
+    assert status == "ok"
+    folds = pl.smooth_necks(path, slack=0.0025)
+    assert len(folds) == len(path)
+    best = [folds[0]]
+    for k, (a, b) in enumerate(zip(path[:-1], path[1:]), 1):
+        m = [min(pl.move_margins(a[5], b, neck=o)) for o in range(len(NECK_OPTIONS))]
+        assert m[folds[k]] >= pl.margin
+        assert m[folds[k]] >= min(max(m), pl.prefer) - 0.0025 - 1e-9
+        best.append(int(np.argmax(m)))
+    v = np.array(NECK_OPTIONS)
+    motion = lambda seq: np.abs(np.diff(v[seq], axis=0)).max(1).sum()
+    assert motion(folds) <= motion(best) + 1e-9

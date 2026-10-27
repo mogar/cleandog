@@ -1,7 +1,7 @@
 """M0 step 3a: plan both whole flights and build the round-trip reference.
 
 Usage:
-  python scripts/rl_reference.py [--morph SEG_CM KNEE SPACING_CM]
+  python scripts/rl_reference.py [--morph SEG_CM KNEE SPACING_CM] [--reuse-plans]
 
 Writes outputs/<date>_rl/plans.json, reference.npz and reference.json (segment
 timings, landing crawl log, sway reductions, 3D static margins). Then run
@@ -59,6 +59,8 @@ def main(argv=None) -> int:
     ap.add_argument("--morph", nargs=3, metavar=("SEG_CM", "KNEE", "SPACING_CM"))
     ap.add_argument("--audit-only", action="store_true",
                     help="re-measure the clearances of the latest reference without re-planning")
+    ap.add_argument("--reuse-plans", action="store_true",
+                    help="rebuild the reference from today's plans.json instead of re-planning (~40 min)")
     args = ap.parse_args(argv)
     if args.audit_only:
         from cleandog_sim.reference import Reference
@@ -79,17 +81,22 @@ def main(argv=None) -> int:
     out = OUTPUTS / f"{dt.date.today().isoformat()}_rl"
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"morphology {key}: planning both whole flights", flush=True)
-    with mp.Pool(2) as pool:
-        res = pool.map(plan_one, [(key, fl) for fl in ("lower", "upper")])
-    paths, plan_info = {}, {}
-    for flight, status, path, secs in res:
-        print(f"  {flight}: {status}, {len(path or []) - 1} moves, {secs:.0f} s", flush=True)
-        if path is None:
-            return 1
-        paths[flight] = [[*st[:5], list(st[5])] for st in path]
-        plan_info[flight] = dict(status=status, moves=len(path) - 1, seconds=round(secs, 1))
-    (out / "plans.json").write_text(json.dumps(dict(morphology=key, paths=paths, info=plan_info)))
+    if args.reuse_plans:
+        plans = json.loads((out / "plans.json").read_text())
+        key, paths, plan_info = tuple(plans["morphology"]), plans["paths"], plans["info"]
+        print(f"morphology {key}: reusing {out / 'plans.json'}", flush=True)
+    else:
+        print(f"morphology {key}: planning both whole flights", flush=True)
+        with mp.Pool(2) as pool:
+            res = pool.map(plan_one, [(key, fl) for fl in ("lower", "upper")])
+        paths, plan_info = {}, {}
+        for flight, status, path, secs in res:
+            print(f"  {flight}: {status}, {len(path or []) - 1} moves, {secs:.0f} s", flush=True)
+            if path is None:
+                return 1
+            paths[flight] = [[*st[:5], list(st[5])] for st in path]
+            plan_info[flight] = dict(status=status, moves=len(path) - 1, seconds=round(secs, 1))
+        (out / "plans.json").write_text(json.dumps(dict(morphology=key, paths=paths, info=plan_info)))
 
     from cleandog_sim.dynamics import pin_model
     from cleandog_sim.reference import round_trip, static_margins
@@ -116,6 +123,7 @@ def main(argv=None) -> int:
         sway_frames={fl: {str(k): v for k, v in d.items()} for fl, d in sway.items()},
         margins=margins[::5].round(4).tolist(), margins_every=5, clearance=clearance,
         clear_viol={fl: float(v.max()) for fl, v in extra["clear_viol"].items()},
+        margin_short={fl: float(v.max()) for fl, v in extra["margin_short"].items()},
         generated=dt.datetime.now().isoformat(timespec="seconds"))))
     print(f"reference: {ref.duration:.0f} s round trip, min 3D static margin {margins.min() * 100:.2f} cm -> {out}")
     for k, c in clearance.items():

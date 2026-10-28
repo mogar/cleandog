@@ -166,8 +166,13 @@ class Poses:
 class Planner:
     def __init__(self, p: RobotParams, sc: Scenario, margin: float = 0.02,
                  n_heights: int = 7, budget: int = 1500, max_sway: float = 0.05, max_pitch: float | None = None,
-                 prefer: float | None = None):
+                 prefer: float | None = None, limb_clear: float = 0.0):
         self.p, self.sc, self.t, self.margin, self.budget = p, sc, sc.terrain, margin, budget
+        # Extra gap (m) between the leg links and the stairs, on top of the link radii. At 0 a
+        # stance shin or thigh may graze a nosing; a policy tracking a few mm off then hits it
+        # (every run-7 gate failure had a limb on the stairs just before it diverged).
+        self.limb_clear = limb_clear
+        self.footholds = None  # optional {leg index: allowed candidate indices}, set by repair()
         # Optional soft margin target (m). `margin` is a hard floor and the search is otherwise
         # indifferent to margin, so a plan can sit just above the floor for long stretches (the
         # N+K robot spent 42 s per ascent below 2 cm against a 1.5 cm floor, and a randomized trunk
@@ -239,7 +244,7 @@ class Planner:
         """feet (N, 2) or (2,). Returns (ok (N,), knee (N, 2))."""
         hip = P.hip(self.p, leg[0] == "F")
         feet = np.broadcast_to(feet, hip.shape)
-        ik = leg_ik(self.p, self.t, hip, feet, self.knee_back[leg])
+        ik = leg_ik(self.p, self.t, hip, feet, self.knee_back[leg], clearance=self.limb_clear)
         # Leave reach for the sideways sway: the 3D hip-foot distance grows to sqrt(d^2 + sway^2).
         in_reach = np.hypot(*(feet - hip).T) <= self.reach_2d
         d = ik.knee - hip
@@ -398,10 +403,11 @@ class Planner:
         shin_len = np.maximum(np.linalg.norm(foot_t - knee_t, axis=-1, keepdims=True), 1e-9)
         tt = t * np.maximum(1.0 - p.foot_radius * 1.5 / shin_len, 0.0)[:, :, None]
         shin = world(knee_t[:, :, None] + tt * (foot_t - knee_t)[:, :, None])
-        clear = ~self.t.solid(thigh[..., 0], thigh[..., 1], clearance=p.thigh_radius).any(-1)
-        clear &= ~self.t.solid(shin[..., 0], shin[..., 1], clearance=p.shin_radius).any(-1)
+        c = self.limb_clear
+        clear = ~self.t.solid(thigh[..., 0], thigh[..., 1], clearance=p.thigh_radius + c).any(-1)
+        clear &= ~self.t.solid(shin[..., 0], shin[..., 1], clearance=p.shin_radius + c).any(-1)
         kw = world(knee_t[:, :, None])[:, :, 0]
-        clear &= ~self.t.solid(kw[..., 0], kw[..., 1], clearance=p.knee_pulley_radius)
+        clear &= ~self.t.solid(kw[..., 0], kw[..., 1], clearance=p.knee_pulley_radius + c)
         return ok & clear
 
     def sway_feasible(self, P: Poses, feet: dict) -> np.ndarray:
@@ -537,7 +543,7 @@ class Planner:
         """Foot positions (1 cm grid) where the whole leg is valid with the body at `pose`:
         reachable within joint limits, thigh and shin clear, and the foot sphere clear of the
         terrain. Returns (gx, gz, free mask (nx, nz), component labels). Cached."""
-        key = (pose, leg)
+        key = (pose, leg, self.limb_clear)
         if key in self._swing_cache:
             return self._swing_cache[key]
         from scipy import ndimage
@@ -621,11 +627,14 @@ class Planner:
 
     def swing_candidates(self, pose, feet_idx, leg_i, sway: float | None = None) -> list[int]:
         """Up to 3 new footholds for leg_i from `pose`; with `sway`, only footholds the leg reaches
-        in 3D with the trunk swayed that far (it holds the sway through the swing)."""
+        in 3D with the trunk swayed that far (it holds the sway through the swing). With
+        `self.footholds` (leg index -> candidate indices), only those."""
         leg = LEGS[leg_i]
         cur = self.cand[feet_idx[leg_i]]
         P = self.pose(*pose)
         idx = np.flatnonzero(self.cand[:, 0] > cur[0] + 0.02)
+        if self.footholds is not None:
+            idx = idx[np.isin(idx, list(self.footholds[leg_i]))]
         if not len(idx):
             return []
         PP = Poses(np.repeat(P.centre, len(idx), 0), np.repeat(P.pitch, len(idx)))
@@ -672,6 +681,15 @@ class Planner:
         the best sway for each, which the reference holds within ~1 mm."""
         return float(min(self.move_margins(feet_idx, child)))
 
+    def move_ok(self, feet_idx, child) -> bool:
+        """The four states of move_margin all pass evaluate: margin floor, reach, limb clearance,
+        trunk and neck clear, and a feasible sway for the lift and the touchdown."""
+        P = self.pose(*child[:3])
+        old, new = self.feet_of(feet_idx), self.feet_of(child[5])
+        leg = next((l for l, a, b in zip(LEGS, feet_idx, child[5]) if a != b), None)
+        checks = [(old, None), (new, None)] + ([(old, leg), (new, leg)] if leg else [])
+        return all(bool(self.evaluate(P, f, lifted=l)[0][0]) for f, l in checks)
+
     def smooth_necks(self, path: list, slack: float = 0.0025) -> list[int]:
         """One NECK_OPTIONS fold per path state (index 0: the start pose), held from that move's
         shift through its swing, chosen for the least total neck motion over the plan (Viterbi,
@@ -707,13 +725,93 @@ class Planner:
             out.append(int(o))
         return out[::-1]
 
-    def plan(self, time_limit: float = 60.0, goal=None):
+    def repair(self, path: list, floors=(0.02, 0.018, 0.0165), limb_clear: float = 0.0,
+               windows=((3, 4), (6, 8)), time_limit: float = 60.0, progress=None) -> tuple[list, list[dict]]:
+        """Re-plan a finished plan locally around its weak moves, without re-planning the flight.
+
+        A whole flight at a 2 cm floor doesn't plan within an hour (N+K robot, 2026-10-20), but
+        only a dozen moves per flight sit near the 1.5 cm floor. A move is weak if its move_margin
+        is below floors[0], or (with `limb_clear`) if it fails move_ok with that much extra gap
+        between the leg links and the stairs. For each weak move: search again from `back` states
+        earlier, on the same footholds, with every move held to a raised floor and the extra gap
+        (strict), until the feet match an original state at most `ahead` states past the weak move
+        and the trunk can shift from there to the next original pose; then splice. Floors go from the highest down to just
+        above the move's own margin (a move weak only on clearance keeps floors[0]); windows from
+        the smallest. Without a plan that keeps the gap, the gap is dropped. Returns (new path, one
+        log entry per weak move); `progress(entry)` is called after each."""
+        import copy
+
+        path, log = list(path), []
+        prog = lambda st: st[0] + self.cand[list(st[5]), 0].mean()
+        same = lambda a, b: a[3:] == b[3:] and np.allclose(a[:3], b[:3], atol=1e-6)
+        chk = copy.copy(self)
+        chk.margin, chk.limb_clear = -np.inf, limb_clear
+        k = 1
+        while k < len(path):
+            m0 = self.move_margin(path[k - 1][5], path[k])
+            clear0 = not limb_clear or chk.move_ok(path[k - 1][5], path[k])
+            if m0 >= floors[0] and clear0:
+                k += 1
+                continue
+            leg = next(l for l, a, b in zip(LEGS, path[k - 1][5], path[k][5]) if a != b)
+            entry = dict(state=k, leg=leg, x=float(path[k][0]), margin=m0, clear=clear0, floor=None,
+                         limb_clear=None, replaced=0, added=0)
+            t0 = time.time()
+            tries = [f for f in floors if f > m0 + 5e-4] or [floors[0]]
+            attempts = [(f, c, w) for c in dict.fromkeys((limb_clear, 0.0)) for f in tries for w in windows]
+            if m0 >= floors[0]:  # weak on clearance only: nothing to gain without the gap
+                attempts = [a for a in attempts if a[1] == limb_clear]
+            for floor, gap, (back, ahead) in attempts:
+                i0, last = max(0, k - 1 - back), len(path) - 1
+                targets = range(k, min(k + ahead, last) + 1)
+                hit = {}
+
+                def goal(st):
+                    for j in targets:
+                        if tuple(st[5]) != tuple(path[j][5]):
+                            continue
+                        # rejoin: the next original shift (4 feet down, base floor) must still work;
+                        # the last state is where the flight hands over, so it must match exactly
+                        if same(st, path[j]) or (j < last and self.path_ok(st[:3], path[j + 1][:3],
+                                                                            self.feet_of(st[5]))):
+                            hit["j"] = j
+                            return True
+                    return False
+
+                local = copy.copy(self)
+                local.margin, local.limb_clear, local.expanded, local.budget = floor, gap, 0, 10**6
+                # Keep the original footholds: the search re-chooses trunk poses, shift sizes, sway,
+                # neck and leg order. Free footholds rarely land back on the original set, which
+                # the rejoin needs (tried: it wanders off at any floor above the original's).
+                local.footholds = {i: {path[t][5][i] for t in range(i0, targets[-1] + 1)} for i in range(4)}
+                lim = prog(path[targets[-1]]) + 0.02
+                sub, _ = local.plan(time_limit=time_limit, goal=goal, start=path[i0],
+                                    prune=lambda st: prog(st) > lim, strict=True)
+                if sub is None:
+                    continue
+                j = hit["j"]
+                path = path[:i0] + sub + path[j + 1:]
+                entry.update(floor=floor, limb_clear=gap, replaced=j - i0, added=len(sub) - 1, back=back,
+                             new_margin=min(self.move_margin(a[5], b) for a, b in zip(sub[:-1], sub[1:])))
+                k = i0 + len(sub)
+                break
+            entry["seconds"] = round(time.time() - t0, 1)
+            log.append(entry)
+            if progress:
+                progress(entry)
+            if entry["floor"] is None:
+                k += 1
+        return path, log
+
+    def plan(self, time_limit: float = 60.0, goal=None, start=None, prune=None, strict: bool = False):
         """Depth-first search. Returns (list of states, status string).
 
-        `goal(state) -> bool` overrides the scenario's goal. On failure, `self.best_path`
-        holds the path that got furthest, for diagnosis.
+        `goal(state) -> bool` overrides the scenario's goal, `start` the initial state, and
+        `prune(state) -> bool` drops states the search shouldn't expand. With `strict`, every move's
+        four margins (move_margin, touchdown included) must clear the floor, not only lift-off and
+        stance. On failure, `self.best_path` holds the path that got furthest, for diagnosis.
         """
-        start = self.initial_state()
+        start = self.initial_state() if start is None else start
         self.best_path = None
         if start is None:
             return None, "no valid start pose"
@@ -735,7 +833,7 @@ class Planner:
             if progress > best_progress:
                 best_progress, self.best_path = progress, path
             key = (x, z, beta, feet_idx)
-            if key in visited:
+            if key in visited or (prune is not None and prune(state)):
                 continue
             visited.add(key)
             self.expanded += 1
@@ -779,6 +877,8 @@ class Planner:
                 tier = 0.0 if self.prefer is None else -self._tier(self.move_margin(feet_idx, c))
                 return (not can_lift, tier, -(c[0] + self.cand[list(c[5]), 0].mean()))
 
+            if strict:
+                children = [c for c in children if self.move_ok(feet_idx, c)]
             children = sorted(children, key=rank)[:8]
             for c in reversed(children):  # best first off the stack
                 stack.append((c, path + [c]))

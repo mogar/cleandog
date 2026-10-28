@@ -1,7 +1,7 @@
 """M0 step 3a: plan both whole flights and build the round-trip reference.
 
 Usage:
-  python scripts/rl_reference.py [--morph SEG_CM KNEE SPACING_CM] [--reuse-plans]
+  python scripts/rl_reference.py [--morph SEG_CM KNEE SPACING_CM] [--reuse-plans [--repair]]
 
 Writes outputs/<date>_rl/plans.json, reference.npz and reference.json (segment
 timings, landing crawl log, sway reductions, 3D static margins). Then run
@@ -36,6 +36,21 @@ def plan_one(args):
     return flight, status, path, time.time() - t0
 
 
+def repair_one(args):
+    """Planner.repair on one flight's plan: moves below REPAIR_FLOORS[0] or without REPAIR_GAP of
+    extra limb clearance are re-planned locally."""
+    from cleandog_sim.reference import REPAIR_FLOORS, REPAIR_GAP, flight_planner
+
+    key, flight, path = args
+    pl = flight_planner(morphology(*key), StairParams(), flight)
+    t0 = time.time()
+    new, log = pl.repair([(*st[:5], tuple(st[5])) for st in path], floors=REPAIR_FLOORS, limb_clear=REPAIR_GAP,
+                         progress=lambda e: print(f"  {flight} state {e['state']} {e['leg']}: margin "
+                                                  f"{e['margin'] * 100:.2f} cm, clear {e['clear']} -> floor {e['floor']}, "
+                                                  f"gap {e['limb_clear']}, {e['seconds']:.0f} s", flush=True))
+    return flight, new, log, time.time() - t0
+
+
 def clearance_audit(p, s, ref, out: Path) -> dict:
     """3D clearances of every frame (legs vs trunk, hip stacks and limbs vs the stairs): writes
     reference_clearance.npz and returns the summary for reference.json."""
@@ -61,6 +76,9 @@ def main(argv=None) -> int:
                     help="re-measure the clearances of the latest reference without re-planning")
     ap.add_argument("--reuse-plans", action="store_true",
                     help="rebuild the reference from today's plans.json instead of re-planning (~40 min)")
+    ap.add_argument("--repair", action="store_true",
+                    help="with --reuse-plans: re-plan the weak moves locally first (Planner.repair) and save the "
+                         "result as plans.json (the input is kept as plans_unrepaired.json)")
     args = ap.parse_args(argv)
     if args.audit_only:
         from cleandog_sim.reference import Reference
@@ -85,6 +103,17 @@ def main(argv=None) -> int:
         plans = json.loads((out / "plans.json").read_text())
         key, paths, plan_info = tuple(plans["morphology"]), plans["paths"], plans["info"]
         print(f"morphology {key}: reusing {out / 'plans.json'}", flush=True)
+        if args.repair:
+            (out / "plans_unrepaired.json").write_text(json.dumps(plans))
+            with mp.Pool(2) as pool:
+                res = pool.map(repair_one, [(key, fl, paths[fl]) for fl in ("lower", "upper")])
+            for flight, path, log, secs in res:
+                done = sum(e["floor"] is not None for e in log)
+                print(f"  {flight}: repaired {done} of {len(log)} weak moves, {len(paths[flight]) - 1} -> "
+                      f"{len(path) - 1} moves, {secs:.0f} s", flush=True)
+                paths[flight] = [[*st[:5], list(st[5])] for st in path]
+                plan_info[flight] = dict(plan_info[flight], moves=len(path) - 1, repair=log)
+            (out / "plans.json").write_text(json.dumps(dict(morphology=key, paths=paths, info=plan_info)))
     else:
         print(f"morphology {key}: planning both whole flights", flush=True)
         with mp.Pool(2) as pool:

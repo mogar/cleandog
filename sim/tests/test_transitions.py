@@ -156,3 +156,23 @@ def test_smooth_necks_moves_less_and_keeps_margin():
     v = np.array(NECK_OPTIONS)
     motion = lambda seq: np.abs(np.diff(v[seq], axis=0)).max(1).sum()
     assert motion(folds) <= motion(best) + 1e-9
+
+
+def test_repair_raises_weak_moves_and_keeps_the_ends():
+    """repair re-plans locally around moves below its floor: every repaired stretch clears the floor
+    it reports, footholds stay the original ones, and the plan still starts and ends where it did."""
+    pl = Planner(RobotParams(), flat_scenario())  # no preference: plenty of moves near the floor
+    path, status = pl.plan(goal=lambda st: st[0] > -0.6, time_limit=60)
+    assert status == "ok"
+    floor = sorted(pl.move_margin(a[5], b) for a, b in zip(path[:-1], path[1:]))[2] + 1e-4
+    new, log = pl.repair(path, floors=(floor,), time_limit=30)
+    assert any(e["floor"] is not None for e in log)
+    assert new[0] == path[0] and new[-1] == path[-1]
+    used = {i: {st[5][i] for st in path} for i in range(4)}
+    assert all(st[5][i] in used[i] for st in new for i in range(4))
+    for e in log:
+        if e["floor"] is not None:
+            assert e["new_margin"] >= e["floor"] - 1e-9
+    m0 = min(pl.move_margin(a[5], b) for a, b in zip(path[:-1], path[1:]))
+    m1 = min(pl.move_margin(a[5], b) for a, b in zip(new[:-1], new[1:]))
+    assert m1 >= m0 - 1e-9

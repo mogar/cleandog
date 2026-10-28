@@ -233,6 +233,11 @@ FLIGHT_MARGIN = 0.015
 # Soft target above the floor (Planner.prefer): the run-4 probe found the N+K robot tipping forward
 # where the plan sat at 1.6-2.0 cm for seconds, with the randomized trunk COM taking ~0.9 cm of it.
 FLIGHT_PREFER = 0.025
+# Planner.repair targets (2026-10-27): in run 7 the gate failures clustered on moves at 1.50-1.56 cm,
+# and every failing trip had a shin, thigh or knee pulley on the stairs just before it diverged,
+# where the reference passed within ~2 mm (the planner's 3 mm collision grid can't resolve less).
+REPAIR_FLOORS = (0.02, 0.018, 0.0165)
+REPAIR_GAP = 0.005
 
 
 def plan_flight(p: RobotParams, s: StairParams, flight: str, time_limit: float = 3600.0):

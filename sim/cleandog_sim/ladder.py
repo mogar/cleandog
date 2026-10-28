@@ -72,8 +72,9 @@ class LegIK:
 
 
 def leg_ik(p: RobotParams, terrain: StairParams | Terrain, hips: np.ndarray, feet: np.ndarray, knee_back: bool,
-           flex_limits: tuple[float, float] = (0.2, 2.7), n_samples: int = 24) -> LegIK:
+           flex_limits: tuple[float, float] = (0.2, 2.7), n_samples: int = 24, clearance: float = 0.0) -> LegIK:
     """Planar two-link IK in the world x-z plane, for a body facing uphill along the slope.
+    `clearance` is kept between the links' surfaces and the stairs (0: touching is allowed).
 
     knee_back puts the knee on the -x side of the hip-foot line (behind it, for a robot
     facing +x). `terrain` may be StairParams, meaning the interior of an endless flight.
@@ -103,7 +104,7 @@ def leg_ik(p: RobotParams, terrain: StairParams | Terrain, hips: np.ndarray, fee
         length = np.maximum(np.hypot(seg[..., 0], seg[..., 1]), 1e-9)
         tt = t * np.maximum(1.0 - skip / length, 0.0)[..., None]  # stop short of the foot
         pts = a_pt[..., None, :] + tt[..., None] * seg[..., None, :]
-        ok &= ~terrain.solid(pts[..., 0], pts[..., 1], clearance=radius).any(axis=-1)
+        ok &= ~terrain.solid(pts[..., 0], pts[..., 1], clearance=radius + clearance).any(axis=-1)
     return LegIK(ok=ok, knee=knee, flex=flex)
 
 
